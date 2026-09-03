@@ -545,6 +545,280 @@ fn says_out_of_credit(body: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn messages() -> Vec<ChatMessage> {
+        vec![ChatMessage {
+            role: "user".into(),
+            content: "hello".into(),
+        }]
+    }
+
+    fn raw_messages() -> Vec<serde_json::Value> {
+        vec![json!({ "role": "user", "content": "hello" })]
+    }
+
+    fn tools() -> serde_json::Value {
+        json!([{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look up a record",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "id": { "type": "string" } },
+                    "required": ["id"]
+                }
+            }
+        }])
+    }
+
+    fn client(server: &MockServer) -> LlmClient {
+        LlmClient::new(&server.uri(), Some("fixture-token"), "fixture-model")
+    }
+
+    #[tokio::test]
+    async fn plain_chat_keeps_the_chat_completions_contract() {
+        let server = MockServer::start().await;
+        let messages = messages();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer fixture-token"))
+            .and(body_json(json!({
+                "model": "fixture-model",
+                "messages": messages,
+                "stream": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "answer" } }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let answer = client(&server).chat(&messages).await.unwrap();
+
+        assert_eq!(answer, "answer");
+    }
+
+    #[tokio::test]
+    async fn plain_chat_rejects_a_non_chat_completions_response_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "output": [{ "content": [{ "text": "not chat completions" }] }]
+            })))
+            .mount(&server)
+            .await;
+
+        let err = client(&server).chat(&messages()).await.unwrap_err();
+
+        assert!(err.to_string().contains("Unexpected LLM response shape"));
+    }
+
+    #[tokio::test]
+    async fn text_stream_keeps_the_chat_completions_sse_contract() {
+        let server = MockServer::start().await;
+        let messages = raw_messages();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_json(json!({
+                "model": "fixture-model",
+                "messages": messages,
+                "stream": true
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+                "text/event-stream",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let stream = client(&server).chat_stream_raw(&messages).await.unwrap();
+        let deltas: Vec<String> = stream.map(|item| item.unwrap()).collect().await;
+
+        assert_eq!(deltas, ["hel", "lo"]);
+    }
+
+    #[tokio::test]
+    async fn non_streaming_tools_keep_the_chat_completions_contract() {
+        let server = MockServer::start().await;
+        let messages = raw_messages();
+        let tools = tools();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_json(json!({
+                "model": "fixture-model",
+                "messages": messages,
+                "tools": tools,
+                "stream": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call-1",
+                            "type": "function",
+                            "function": { "name": "lookup", "arguments": "{\"id\":\"42\"}" }
+                        }]
+                    }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let turn = client(&server).chat_tools(&messages, &tools).await.unwrap();
+
+        assert!(turn.content.is_none());
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].id, "call-1");
+        assert_eq!(turn.tool_calls[0].name, "lookup");
+        assert_eq!(turn.tool_calls[0].arguments, "{\"id\":\"42\"}");
+    }
+
+    #[tokio::test]
+    async fn streaming_tools_assemble_interleaved_fragmented_calls_by_index() {
+        let server = MockServer::start().await;
+        let messages = raw_messages();
+        let tools = tools();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_json(json!({
+                "model": "fixture-model",
+                "messages": messages,
+                "tools": tools,
+                "stream": true
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Checking \"}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"id\\\":\"}},{\"index\":1,\"id\":\"call-2\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"id\\\":\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"\\\"99\\\"}\"}},{\"index\":0,\"function\":{\"arguments\":\"\\\"42\\\"}\"}}]}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+                "text/event-stream",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut stream = Box::pin(
+            client(&server)
+                .chat_tools_stream(&messages, &tools)
+                .await
+                .unwrap(),
+        );
+        let first = stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+
+        match first {
+            ToolStreamItem::Delta(text) => assert_eq!(text, "Checking "),
+            ToolStreamItem::Turn(_) => panic!("expected the text delta first"),
+        }
+        match second {
+            ToolStreamItem::Turn(turn) => {
+                assert_eq!(turn.content.as_deref(), Some("Checking "));
+                assert_eq!(turn.tool_calls.len(), 2);
+                assert_eq!(turn.tool_calls[0].id, "call-1");
+                assert_eq!(turn.tool_calls[0].name, "lookup");
+                assert_eq!(turn.tool_calls[0].arguments, "{\"id\":\"42\"}");
+                assert_eq!(turn.tool_calls[1].id, "call-2");
+                assert_eq!(turn.tool_calls[1].name, "lookup");
+                assert_eq!(turn.tool_calls[1].arguments, "{\"id\":\"99\"}");
+            }
+            ToolStreamItem::Delta(_) => panic!("expected the assembled turn last"),
+        }
+    }
+
+    #[test]
+    fn tool_history_keeps_the_chat_completions_wire_shape() {
+        let turn = AssistantTurn {
+            content: Some("done".into()),
+            tool_calls: vec![ToolCall {
+                id: "call-1".into(),
+                name: "lookup".into(),
+                arguments: "{\"id\":\"42\"}".into(),
+            }],
+        };
+
+        assert_eq!(
+            turn.to_message(),
+            json!({
+                "role": "assistant",
+                "content": "done",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": { "name": "lookup", "arguments": "{\"id\":\"42\"}" }
+                }]
+            })
+        );
+        assert_eq!(
+            tool_result_message("call-1", "record 42"),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "record 42"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn embeddings_keep_the_separate_embeddings_contract() {
+        let server = MockServer::start().await;
+        let texts = vec!["alpha".to_string(), "beta".to_string()];
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .and(body_json(json!({
+                "model": "fixture-model",
+                "input": texts
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    { "embedding": [0.25, -0.5] },
+                    { "embedding": [1.0, 0.0] }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let vectors = client(&server).embed(&texts).await.unwrap();
+
+        assert_eq!(vectors, vec![vec![0.25, -0.5], vec![1.0, 0.0]]);
+    }
+
+    #[tokio::test]
+    async fn an_http_429_is_classified_with_its_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "7")
+                    .set_body_json(json!({ "error": { "message": "slow down" } })),
+            )
+            .mount(&server)
+            .await;
+
+        let err = client(&server).chat(&messages()).await.unwrap_err();
+        let hit = rate_limited(&err).expect("429 must stay a typed rate limit");
+
+        assert_eq!(hit.status, 429);
+        assert_eq!(hit.retry_after, Some(Duration::from_secs(7)));
+        assert_eq!(hit.detail, "slow down");
+    }
 
     /// 真发一次注定失败的请求，拿一个货真价实的 `reqwest::Error`。
     /// 端口 1 上不会有东西监听，而 127.0.0.1 不走代理。
