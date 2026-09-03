@@ -42,6 +42,7 @@ The test for writing one: if someone (including us) looks at a piece of code in 
 | 0016 | [Close the open seams before cutting new ones](0016-close-the-open-seams-before-cutting-new-ones.md) | In progress · A done · B done (B4 deferred) · C untouched · D2 worked around (#231); the lakehouse landed ahead of D4 (#239) |
 | 0017 | [A contradiction points at an error upstream](0017-a-contradiction-points-upstream.md) | Implemented · B2a: engine and queue, per-item cap, aggregation by rule pair, cards with clues and repairs (#238) · B2b: contested edges in the alert colour, ghost edges for blocked derivations, the disputed chip and the "did not land" section in the panel (#243) |
 | 0018 | [The lakehouse is one protocol away](0018-the-lakehouse-is-one-protocol-away.md) | Implemented: Trino (Iceberg / Delta / Hive), Databricks and Snowflake behind the same trait, scheme picks the engine (#239) · replay tests only, real clusters wanted (#240–#242) · MaxCompute waits |
+| 0019 | [Background Responses is a separate provider](0019-background-responses-is-a-separate-provider.md) | Implemented in code · Chat Completions remains the default and rollback path · entitlement, provider authorization, deployment, and live canary remain separate gates |
 
 ## Not a decision record
 

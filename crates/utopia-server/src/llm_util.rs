@@ -1,11 +1,13 @@
-//! 从工作区设置构造 LLM 客户端，以及按模型的并发闸门。
+//! LLM clients and concurrency gates for interactive and background work.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use utopia_core::config::{AppConfig, BackgroundLlmProvider};
 use utopia_core::models::LlmSettings;
-use utopia_llm::LlmClient;
+use utopia_llm::{BackgroundTextClient, ChatMessage, LlmClient};
 
 use crate::state::AppState;
 
@@ -31,6 +33,124 @@ pub fn embed_client(s: &LlmSettings) -> Option<LlmClient> {
     ))
 }
 
+/// Deployment-scoped background provider. Interactive chat never reads this object.
+#[derive(Clone)]
+pub struct BackgroundRuntime {
+    provider: BackgroundLlmProvider,
+    codex_client: Option<Arc<utopia_llm::CodexResponsesClient>>,
+    codex_gate: Option<Arc<Semaphore>>,
+}
+
+impl BackgroundRuntime {
+    pub fn from_config(cfg: &AppConfig) -> anyhow::Result<Self> {
+        cfg.validate()?;
+        match cfg.background_llm_provider {
+            BackgroundLlmProvider::ChatCompletions => Ok(Self {
+                provider: BackgroundLlmProvider::ChatCompletions,
+                codex_client: None,
+                codex_gate: None,
+            }),
+            BackgroundLlmProvider::CodexResponses => {
+                let home = cfg
+                    .codex_home
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("Codex credential home is missing"))?;
+                let model = cfg
+                    .codex_model
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("Codex model is missing"))?;
+                let auth = Arc::new(utopia_llm::CodexAuthManager::new(home)?);
+                let client = Arc::new(utopia_llm::CodexResponsesClient::new(auth, model)?);
+                Ok(Self {
+                    provider: BackgroundLlmProvider::CodexResponses,
+                    codex_client: Some(client),
+                    codex_gate: Some(Arc::new(Semaphore::new(cfg.codex_max_concurrency as usize))),
+                })
+            }
+        }
+    }
+
+    pub fn ready(&self, settings: Option<&LlmSettings>) -> bool {
+        self.client(settings).is_some()
+    }
+
+    pub fn client(&self, settings: Option<&LlmSettings>) -> Option<BackgroundTextClient> {
+        match self.provider {
+            BackgroundLlmProvider::ChatCompletions => settings
+                .and_then(chat_client)
+                .map(BackgroundTextClient::ChatCompletions),
+            BackgroundLlmProvider::CodexResponses => self
+                .codex_client
+                .clone()
+                .map(|client| BackgroundTextClient::CodexResponses((*client).clone())),
+        }
+    }
+
+    async fn acquire(
+        &self,
+        state: &AppState,
+        settings: Option<&LlmSettings>,
+        client: &BackgroundTextClient,
+    ) -> Option<OwnedSemaphorePermit> {
+        if client.is_codex_responses() {
+            return self.codex_gate.as_ref()?.clone().acquire_owned().await.ok();
+        }
+        match settings {
+            Some(settings) => acquire_chat(state, settings).await,
+            None => None,
+        }
+    }
+}
+
+/// Background text completion with the same bounded rate-limit retry policy for both providers.
+pub async fn complete_with_rate_limit_retry(
+    state: &AppState,
+    settings: Option<&LlmSettings>,
+    runtime: &BackgroundRuntime,
+    client: &BackgroundTextClient,
+    messages: &[ChatMessage],
+) -> anyhow::Result<String> {
+    const RATE_LIMIT_TRIES: u32 = 5;
+    const RATE_LIMIT_CAP: Duration = Duration::from_secs(60);
+    let mut backoff = Duration::from_secs(2);
+    for attempt in 1..=RATE_LIMIT_TRIES {
+        let outcome = {
+            let _permit = runtime.acquire(state, settings, client).await;
+            client.complete(messages).await.map_err(anyhow::Error::new)
+        };
+        let err = match outcome {
+            Ok(reply) => return Ok(reply),
+            Err(error) => error,
+        };
+        let Some(hit) = utopia_llm::rate_limited(&err) else {
+            return Err(err);
+        };
+        if attempt == RATE_LIMIT_TRIES {
+            return Err(err.context(format!("限流退避 {RATE_LIMIT_TRIES} 次仍未通过")));
+        }
+        let delay = jitter(hit.retry_after.unwrap_or(backoff).min(RATE_LIMIT_CAP));
+        tracing::warn!(
+            attempt,
+            delay_ms = delay.as_millis() as u64,
+            from_header = hit.retry_after.is_some(),
+            provider = client.identity().provenance_label(),
+            "后台模型限流，退避后重试"
+        );
+        tokio::time::sleep(delay).await;
+        backoff = (backoff * 2).min(RATE_LIMIT_CAP);
+    }
+    unreachable!("限流循环内必定 return")
+}
+
+fn jitter(base: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::from(duration.subsec_nanos()))
+        .unwrap_or(0);
+    let half = (base.as_millis() as u64) / 2;
+    base / 2 + Duration::from_millis(if half == 0 { 0 } else { nanos % half })
+}
+
 /// 按模型的信号量注册表。限额变了就换一把新的——旧的在飞许可自然跑完，
 /// 换的瞬间可能短暂超出新限额，可接受；换来的是"改完即时生效"而不必做
 /// 缓存失效，也不必和 tokio Semaphore 不能缩容的限制搏斗。
@@ -54,13 +174,6 @@ impl ModelGates {
 }
 
 /// 后台任务调模型前取一张许可，持有到调用结束。
-///
-/// **只给后台任务用**（抽取、裁决、摄入嵌入、本体建议）。用户的对话与检索
-/// 不走这里——让人打字等在十个后台抽取后面，产品就成了坏的；真正会打爆
-/// 供应商速率限制的也从来不是一个人在打字。
-///
-/// 限额读不到（表还没建、库暂时不可达）时**放行**：并发限制是保护措施，
-/// 不该因为读不到配置而把整条流水线卡死。
 pub async fn acquire(
     state: &AppState,
     base_url: &str,
@@ -78,14 +191,144 @@ pub async fn acquire(
         .ok()
 }
 
-/// `acquire` 的便捷形式：直接从工作区设置取 chat 模型的身份。
 pub async fn acquire_chat(state: &AppState, s: &LlmSettings) -> Option<OwnedSemaphorePermit> {
     let (base, model) = (s.chat_base_url.as_deref()?, s.chat_model.as_deref()?);
     acquire(state, base, model).await
 }
 
-/// `acquire` 的便捷形式：embedding 模型。
 pub async fn acquire_embed(state: &AppState, s: &LlmSettings) -> Option<OwnedSemaphorePermit> {
     let (base, model) = (s.embed_base_url.as_deref()?, s.embed_model.as_deref()?);
     acquire(state, base, model).await
+}
+
+#[cfg(test)]
+mod codex_builder_contract_tests {
+    use serde_json::{json, Value};
+    use std::fs;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use utopia_extract::{
+        build_adjudication_messages, build_messages, AdjudicationPair, AdjudicationSide,
+        PromptRelation,
+    };
+    use utopia_llm::{BackgroundTextClient, ChatMessage, CodexAuthManager, CodexResponsesClient};
+    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn auth_fixture() -> (TempDir, Arc<CodexAuthManager>) {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let auth_path = dir.path().join("auth.json");
+        fs::write(
+            &auth_path,
+            json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "access-fixture",
+                    "refresh_token": "refresh-fixture",
+                    "id_token": "id-fixture",
+                    "account_id": "account-fixture"
+                },
+                "last_refresh": "2099-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let auth = Arc::new(CodexAuthManager::new(dir.path()).unwrap());
+        (dir, auth)
+    }
+
+    fn request_body(model: &str, messages: &[ChatMessage]) -> Value {
+        json!({
+            "model": model,
+            "instructions": messages[0].content,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": messages[1].content}]
+            }],
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "reasoning": null,
+            "store": false,
+            "stream": true,
+            "include": []
+        })
+    }
+
+    fn completed_stream() -> &'static str {
+        "event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"{\\\"verdicts\\\":[{\\\"i\\\":0,\\\"verdict\\\":\\\"same\\\",\\\"confidence\\\":0.9}]}\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+    }
+
+    #[tokio::test]
+    async fn real_extraction_and_adjudication_builders_use_the_same_codex_contract() {
+        let extraction_messages = build_messages(
+            &[("person".into(), "Person".into(), "a named person".into())],
+            &[PromptRelation {
+                key: "works_at".into(),
+                label: "works at".into(),
+                description: "employment relationship".into(),
+                signature: "person → organization".into(),
+            }],
+            &[],
+            Some("2026-01-02"),
+            "fixture.md",
+            &[],
+            "Alice works at Acme.",
+        );
+        let adjudication_messages = build_adjudication_messages(&[AdjudicationPair {
+            left: AdjudicationSide {
+                name: "Alice".into(),
+                type_label: "person".into(),
+                facts: vec!["works_at: Acme".into()],
+            },
+            right: AdjudicationSide {
+                name: "Alice Smith".into(),
+                type_label: "person".into(),
+                facts: vec!["works_at: Acme".into()],
+            },
+        }]);
+        assert_eq!(extraction_messages.len(), 2);
+        assert_eq!(adjudication_messages.len(), 2);
+
+        let server = MockServer::start().await;
+        for messages in [&extraction_messages, &adjudication_messages] {
+            let request = Mock::given(method("POST"))
+                .and(path("/responses"))
+                .and(body_json(request_body("codex-model", messages)))
+                .and(header("authorization", "Bearer access-fixture"))
+                .and(header("ChatGPT-Account-ID", "account-fixture"));
+            request
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(completed_stream(), "text/event-stream"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let (_dir, auth) = auth_fixture();
+        let client =
+            CodexResponsesClient::with_base_url(auth, "codex-model", server.uri()).unwrap();
+        let background = BackgroundTextClient::CodexResponses(client);
+        let extraction_reply = background.complete(&extraction_messages).await.unwrap();
+        let extraction = utopia_extract::parse_response(&extraction_reply).unwrap();
+        assert!(extraction.entities.is_empty());
+        assert!(extraction.facts.is_empty());
+
+        let adjudication_reply = background.complete(&adjudication_messages).await.unwrap();
+        let verdicts = utopia_extract::parse_adjudication(&adjudication_reply).unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].i, 0);
+        assert_eq!(verdicts[0].verdict, "same");
+    }
 }

@@ -6,7 +6,7 @@
 use crate::llm_util;
 use crate::state::AppState;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use utopia_core::models::ReviewItem;
 use utopia_core::AppError;
 use uuid::Uuid;
@@ -15,8 +15,11 @@ const BATCH_SIZE: i64 = 12;
 const AUTO_CONF: f32 = 0.8;
 const MAX_ROUNDS: usize = 20;
 
-/// 缓存键：类型 + 双方名字 + 事实摘要（与实体 id 无关——重传文档不重复付费）。
-fn pair_key(item: &ReviewItem) -> String {
+/// 缓存键：提供方身份 + 类型 + 双方名字 + 事实摘要。
+///
+/// 提供方身份必须进入键：Chat Completions 与 Codex Responses 的提示词语义、账号
+/// 与策略边界不同，不能把一个提供方的判断静默当成另一个提供方的判断。
+fn pair_key(item: &ReviewItem, model_identity: &str) -> String {
     let side = |s: &utopia_core::models::ReviewSide| {
         format!(
             "{}|{}|{}",
@@ -28,18 +31,41 @@ fn pair_key(item: &ReviewItem) -> String {
     };
     let mut sides = [side(&item.left), side(&item.right)];
     sides.sort();
-    let digest = Sha256::digest(sides.join("##").as_bytes());
+    let cache_material = if model_identity.is_empty() {
+        sides.join("##")
+    } else {
+        format!("{model_identity}\0{}", sides.join("##"))
+    };
+    let digest = Sha256::digest(cache_material.as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn validate_verdicts(
+    verdicts: &[utopia_extract::AdjudicationVerdict],
+    expected: usize,
+) -> anyhow::Result<()> {
+    let indices: HashSet<usize> = verdicts.iter().map(|verdict| verdict.i).collect();
+    if verdicts.len() != expected
+        || indices.len() != expected
+        || indices.iter().any(|index| *index >= expected)
+    {
+        anyhow::bail!("adjudication response does not cover each requested pair exactly once");
+    }
+    if verdicts.iter().any(|verdict| {
+        !matches!(verdict.verdict.as_str(), "same" | "different" | "unsure")
+            || verdict.confidence.is_some_and(|confidence| {
+                !confidence.is_finite() || !(0.0..=1.0).contains(&confidence)
+            })
+    }) {
+        anyhow::bail!("adjudication response contains an invalid verdict");
+    }
+    Ok(())
 }
 
 pub async fn adjudicate_entities(state: &AppState, kb_id: Uuid) -> anyhow::Result<()> {
     let kb = utopia_store::kbs::get(&state.pool, kb_id).await?;
     let settings = utopia_store::settings::get(&state.pool, kb.workspace_id).await?;
-    let client = settings.as_ref().and_then(llm_util::chat_client);
-    let model = settings
-        .as_ref()
-        .and_then(|s| s.chat_model.clone())
-        .unwrap_or_default();
+    let client = state.background.client(settings.as_ref());
 
     let Some(client) = client else {
         // 无模型可用：全部转人工，任务本身成功结束
@@ -52,6 +78,7 @@ pub async fn adjudicate_entities(state: &AppState, kb_id: Uuid) -> anyhow::Resul
         state.emit_review(kb_id);
         return Ok(());
     };
+    let model_identity = client.identity().provenance_label();
 
     for _ in 0..MAX_ROUNDS {
         let items =
@@ -63,7 +90,7 @@ pub async fn adjudicate_entities(state: &AppState, kb_id: Uuid) -> anyhow::Resul
         // 第一层：裁决缓存
         let mut to_ask: Vec<(ReviewItem, String)> = Vec::new();
         for item in items {
-            let key = pair_key(&item);
+            let key = pair_key(&item, &client.identity().cache_namespace());
             match utopia_store::resolution::get_verdict(&state.pool, kb_id, &key).await? {
                 Some((same, conf)) => {
                     apply_verdict(state, kb_id, &item, same, conf, "cached").await?
@@ -101,13 +128,16 @@ pub async fn adjudicate_entities(state: &AppState, kb_id: Uuid) -> anyhow::Resul
             .collect();
         let messages = utopia_extract::build_adjudication_messages(&pairs);
         // 调用/解析失败 → 任务按退避重试；重试耗尽后行停留在队列里，人工仍可定夺
-        let _permit = settings.as_ref().map(|s| llm_util::acquire_chat(state, s));
-        let _permit = match _permit {
-            Some(f) => f.await,
-            None => None,
-        };
-        let reply = client.chat(&messages).await?;
+        let reply = llm_util::complete_with_rate_limit_retry(
+            state,
+            settings.as_ref(),
+            state.background.as_ref(),
+            &client,
+            &messages,
+        )
+        .await?;
         let verdicts = utopia_extract::parse_adjudication(&reply)?;
+        validate_verdicts(&verdicts, to_ask.len())?;
         let by_i: HashMap<usize, &utopia_extract::AdjudicationVerdict> =
             verdicts.iter().map(|v| (v.i, v)).collect();
 
@@ -126,7 +156,7 @@ pub async fn adjudicate_entities(state: &AppState, kb_id: Uuid) -> anyhow::Resul
                         key,
                         same,
                         conf,
-                        &model,
+                        &model_identity,
                     )
                     .await?;
                     apply_verdict(state, kb_id, item, same, conf, "adjudicated").await?;
@@ -238,4 +268,34 @@ async fn apply_verdict(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_verdicts;
+    use utopia_extract::AdjudicationVerdict;
+
+    fn verdict(i: usize) -> AdjudicationVerdict {
+        AdjudicationVerdict {
+            i,
+            verdict: "same".into(),
+            confidence: Some(0.9),
+        }
+    }
+
+    #[test]
+    fn adjudication_requires_exact_index_coverage() {
+        assert!(validate_verdicts(&[verdict(0), verdict(1)], 2).is_ok());
+        assert!(validate_verdicts(&[verdict(0)], 2).is_err());
+        assert!(validate_verdicts(&[verdict(0), verdict(0)], 2).is_err());
+        assert!(validate_verdicts(&[verdict(0), verdict(2)], 2).is_err());
+
+        let mut unknown = verdict(0);
+        unknown.verdict = "unexpected".into();
+        assert!(validate_verdicts(&[unknown], 1).is_err());
+
+        let mut out_of_range = verdict(0);
+        out_of_range.confidence = Some(1.1);
+        assert!(validate_verdicts(&[out_of_range], 1).is_err());
+    }
 }

@@ -1,6 +1,14 @@
 //! utopia-llm: OpenAI 兼容协议的薄客户端。
 //! 一套代码适配 DeepSeek / Qwen(DashScope 兼容模式) / GLM / OpenAI / Ollama / vLLM。
 
+pub mod background;
+pub mod codex;
+
+pub use background::{
+    BackgroundAuthFailure, BackgroundModelIdentity, BackgroundTextClient, BackgroundTextError,
+};
+pub use codex::{CodexAuthError, CodexAuthManager, CodexResponsesClient};
+
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -100,7 +108,12 @@ pub struct RateLimited {
 
 /// anyhow 错误链里的 [`RateLimited`]，穿透 context 层。
 pub fn rate_limited(err: &anyhow::Error) -> Option<&RateLimited> {
-    err.chain().find_map(|e| e.downcast_ref::<RateLimited>())
+    err.chain().find_map(|e| {
+        e.downcast_ref::<RateLimited>().or_else(|| {
+            e.downcast_ref::<background::BackgroundTextError>()
+                .and_then(background::BackgroundTextError::rate_limited)
+        })
+    })
 }
 
 /// 账号付不起这次请求：欠费，或者套餐配额用尽。
@@ -120,7 +133,20 @@ pub struct OutOfCredit {
 
 /// anyhow 错误链里的 [`OutOfCredit`]，穿透 context 层。
 pub fn out_of_credit(err: &anyhow::Error) -> Option<&OutOfCredit> {
-    err.chain().find_map(|e| e.downcast_ref::<OutOfCredit>())
+    err.chain().find_map(|e| {
+        e.downcast_ref::<OutOfCredit>().or_else(|| {
+            e.downcast_ref::<background::BackgroundTextError>()
+                .and_then(background::BackgroundTextError::out_of_credit)
+        })
+    })
+}
+
+pub fn is_permanent_authentication(err: &anyhow::Error) -> bool {
+    err.chain().any(|error| {
+        error
+            .downcast_ref::<background::BackgroundTextError>()
+            .is_some_and(BackgroundTextError::is_permanent_authentication)
+    })
 }
 
 /// `Retry-After` 的整数秒形态。
