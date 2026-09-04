@@ -1,5 +1,6 @@
 use pgvector::Vector;
 use sqlx::PgPool;
+use sqlx::{Postgres, Transaction};
 use utopia_core::models::{ChunkView, Document, DocumentPage};
 use utopia_core::{AppError, AppResult};
 use utopia_ingest::ChunkPiece;
@@ -209,6 +210,22 @@ pub async fn find_by_source_sha(
     )
 }
 
+/// KB 内按内容哈希找已有文档：来源身份不同但内容相同的冲突，也必须返回
+/// 真实 document_id，供 durable hydration 的 replay 收尾使用。
+pub async fn find_by_kb_sha(
+    pool: &PgPool,
+    kb_id: Uuid,
+    sha256: &str,
+) -> AppResult<Option<Document>> {
+    Ok(
+        sqlx::query_as("SELECT * FROM documents WHERE kb_id = $1 AND sha256 = $2 LIMIT 1")
+            .bind(kb_id)
+            .bind(sha256)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
 /// 迁移前的历史文档（无 external_key）按文件名认领——0008 之前建的行的一次性兜底。
 pub async fn find_legacy_by_filename(
     pool: &PgPool,
@@ -261,6 +278,71 @@ pub async fn replace_content(
     .bind(doc_time)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Replace a document and enqueue its processing job as one database transaction.
+/// The content-addressed blob must already be durable before this function is called.
+#[allow(clippy::too_many_arguments)]
+pub async fn replace_content_and_enqueue_processing(
+    pool: &PgPool,
+    id: Uuid,
+    filename: &str,
+    mime: &str,
+    size_bytes: i64,
+    sha256: &str,
+    doc_time: Option<chrono::DateTime<chrono::Utc>>,
+) -> AppResult<()> {
+    let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
+    let exists: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM documents WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if exists.is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    sqlx::query(
+        "UPDATE documents SET filename = $2, mime = $3, size_bytes = $4, sha256 = $5,
+                doc_time = COALESCE($6, doc_time),
+                doc_time_source = CASE WHEN $6 IS NULL THEN doc_time_source ELSE 'source' END,
+                status = 'pending', graph_status = 'none', error = NULL,
+                missing_since = NULL, updated_at = now()
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(filename)
+    .bind(mime)
+    .bind(size_bytes)
+    .bind(sha256)
+    .bind(doc_time)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes)
+         VALUES ($1, $2,
+                 (SELECT coalesce(max(version), 0) + 1
+                    FROM document_versions
+                   WHERE document_id = $2),
+                 $3, $4)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(id)
+    .bind(sha256)
+    .bind(size_bytes)
+    .execute(&mut *tx)
+    .await?;
+
+    crate::jobs::enqueue_with_max_attempts_tx(
+        &mut tx,
+        "process_document",
+        serde_json::json!({ "document_id": id }),
+        3,
+    )
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 

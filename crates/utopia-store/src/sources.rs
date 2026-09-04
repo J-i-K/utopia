@@ -37,6 +37,38 @@ pub fn validate_cron(expr: &str) -> AppResult<String> {
     Ok(normalized)
 }
 
+pub const RSS_CONTENT_MODE_KEY: &str = "content_mode";
+pub const RSS_FULL_CONTENT_MODE: &str = "full_new_items";
+
+/// RSS mode is deliberately a small enum in the persisted source config. Old
+/// rows without the key retain the legacy feed behavior.
+pub fn rss_content_mode(config: &serde_json::Value) -> AppResult<&'static str> {
+    let Some(value) = config.get(RSS_CONTENT_MODE_KEY) else {
+        return Ok("feed");
+    };
+    let Some(value) = value.as_str() else {
+        return Err(AppError::invalid(
+            "rss_content_mode_invalid",
+            "RSS content_mode must be feed or full_new_items",
+        ));
+    };
+    match value {
+        "feed" => Ok("feed"),
+        RSS_FULL_CONTENT_MODE => Ok(RSS_FULL_CONTENT_MODE),
+        _ => Err(AppError::invalid(
+            "rss_content_mode_invalid",
+            "RSS content_mode must be feed or full_new_items",
+        )),
+    }
+}
+
+pub fn rss_full_content_enabled(kind: &str, config: &serde_json::Value) -> AppResult<bool> {
+    if SourceKind::parse(kind) != Some(SourceKind::Rss) {
+        return Ok(false);
+    }
+    Ok(rss_content_mode(config)? == RSS_FULL_CONTENT_MODE)
+}
+
 /// cron 的下一次触发时刻（服务器本地时区）。
 fn cron_next_after(expr: &str, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
     use std::str::FromStr;
@@ -58,7 +90,33 @@ pub async fn list(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<SourceView>> {
                 s.last_sync_at, s.last_sync_status, s.last_sync_error, s.last_sync_added,
                 (SELECT count(*) FROM documents d WHERE d.source_id = s.id) AS doc_count,
                 (SELECT count(*) FROM documents d
-                 WHERE d.source_id = s.id AND d.missing_since IS NOT NULL) AS missing_count
+                 WHERE d.source_id = s.id AND d.missing_since IS NOT NULL) AS missing_count,
+                (SELECT r.activation_state FROM rss_full_content_sources r
+                 WHERE r.source_id = s.id) AS rss_full_content_state,
+                (SELECT r.activation_generation FROM rss_full_content_sources r
+                 WHERE r.source_id = s.id) AS rss_full_content_generation,
+                (SELECT r.baseline_count FROM rss_full_content_sources r
+                 WHERE r.source_id = s.id) AS rss_full_content_baseline_count,
+                COALESCE((SELECT count(*) FROM rss_full_content_entries e
+                 JOIN rss_full_content_sources r ON r.source_id = e.source_id
+                 WHERE e.source_id = s.id AND e.activation_generation = r.activation_generation
+                   AND e.state = 'pending'), 0) AS rss_full_content_pending_count,
+                COALESCE((SELECT count(*) FROM rss_full_content_entries e
+                 JOIN rss_full_content_sources r ON r.source_id = e.source_id
+                 WHERE e.source_id = s.id AND e.activation_generation = r.activation_generation
+                   AND e.state IN ('queued', 'hydrating')), 0) AS rss_full_content_queued_count,
+                COALESCE((SELECT count(*) FROM rss_full_content_entries e
+                 JOIN rss_full_content_sources r ON r.source_id = e.source_id
+                 WHERE e.source_id = s.id AND e.activation_generation = r.activation_generation
+                   AND e.state = 'retry_wait'), 0) AS rss_full_content_retrying_count,
+                COALESCE((SELECT count(*) FROM rss_full_content_entries e
+                 JOIN rss_full_content_sources r ON r.source_id = e.source_id
+                 WHERE e.source_id = s.id AND e.activation_generation = r.activation_generation
+                   AND e.state = 'complete'), 0) AS rss_full_content_complete_count,
+                COALESCE((SELECT count(*) FROM rss_full_content_entries e
+                 JOIN rss_full_content_sources r ON r.source_id = e.source_id
+                 WHERE e.source_id = s.id AND e.activation_generation = r.activation_generation
+                   AND e.state = 'terminal'), 0) AS rss_full_content_terminal_count
          FROM sources s WHERE s.kb_id = $1 ORDER BY s.created_at",
     )
     .bind(kb_id)
@@ -112,11 +170,14 @@ pub async fn create(
     } else {
         config.clone()
     };
-    let source = sqlx::query_as(
+    let full_content = rss_full_content_enabled(kind, &config)?;
+    let source_id = Uuid::now_v7();
+    let mut tx = pool.begin().await?;
+    let source: Source = sqlx::query_as(
         "INSERT INTO sources (id, kb_id, kind, name, config, icon, sync_interval_minutes, sync_cron)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *",
     )
-    .bind(Uuid::now_v7())
+    .bind(source_id)
     .bind(kb_id)
     .bind(kind)
     .bind(name.trim())
@@ -124,8 +185,12 @@ pub async fn create(
     .bind(icon)
     .bind(interval)
     .bind(cron_norm)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    if full_content {
+        crate::rss_full_content::initialize_source(&mut tx, source.id).await?;
+    }
+    tx.commit().await?;
     Ok(source)
 }
 
@@ -160,6 +225,24 @@ pub async fn update(
         }
         None => None,
     };
+
+    let mut tx = pool.begin().await?;
+    let previous: Source = sqlx::query_as("SELECT * FROM sources WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let next_config = config
+        .map(|value| {
+            if value.is_null() {
+                serde_json::json!({})
+            } else {
+                value.clone()
+            }
+        })
+        .unwrap_or_else(|| previous.config.clone());
+    let old_full = rss_full_content_enabled(&previous.kind, &previous.config)?;
+    let new_full = rss_full_content_enabled(&previous.kind, &next_config)?;
     let source = sqlx::query_as(
         "UPDATE sources SET
             name = COALESCE($2, name),
@@ -171,14 +254,26 @@ pub async fn update(
     )
     .bind(id)
     .bind(name)
-    .bind(config)
+    .bind(config.map(|value| {
+        if value.is_null() {
+            serde_json::json!({})
+        } else {
+            value.clone()
+        }
+    }))
     .bind(icon)
     .bind(schedule.is_some())
     .bind(schedule.as_ref().and_then(|(i, _)| *i))
     .bind(schedule.as_ref().and_then(|(_, c)| c.clone()))
-    .fetch_optional(pool)
-    .await?
-    .ok_or(AppError::NotFound)?;
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if !old_full && new_full {
+        crate::rss_full_content::enable_source(&mut tx, id).await?;
+    } else if old_full && !new_full {
+        crate::rss_full_content::disable_source(&mut tx, id).await?;
+    }
+    tx.commit().await?;
     Ok(source)
 }
 
@@ -423,5 +518,27 @@ mod tests {
         let next = cron_next_after("*/5 * * * *", after).unwrap();
         assert!(next > after);
         assert!((next - after).num_minutes() <= 5);
+    }
+
+    #[test]
+    fn rss_content_mode_defaults_and_validates() {
+        assert_eq!(rss_content_mode(&serde_json::json!({})).unwrap(), "feed");
+        assert_eq!(
+            rss_content_mode(&serde_json::json!({ "content_mode": "feed" })).unwrap(),
+            "feed"
+        );
+        assert_eq!(
+            rss_content_mode(&serde_json::json!({ "content_mode": "full_new_items" })).unwrap(),
+            "full_new_items"
+        );
+        assert!(rss_content_mode(&serde_json::json!({ "content_mode": "all" })).is_err());
+        assert!(rss_content_mode(&serde_json::json!({ "content_mode": true })).is_err());
+        assert!(!rss_full_content_enabled(
+            "url",
+            &serde_json::json!({
+                "content_mode": "full_new_items"
+            })
+        )
+        .unwrap());
     }
 }

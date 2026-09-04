@@ -5,7 +5,7 @@
 //! 目标数经 AtomicUsize 热读——系统设置里改并发即时生效，无需重启。
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,12 +22,53 @@ pub struct Job {
 }
 
 pub async fn enqueue(pool: &PgPool, kind: &str, payload: serde_json::Value) -> AppResult<i64> {
-    let (id,): (i64,) =
-        sqlx::query_as("INSERT INTO jobs (kind, payload) VALUES ($1, $2) RETURNING id")
-            .bind(kind)
-            .bind(payload)
-            .fetch_one(pool)
-            .await?;
+    enqueue_with_max_attempts(pool, kind, payload, 3).await
+}
+
+/// 入队并显式指定有限的重试预算。调用方不能把一个外部系统的任务变成无限重试。
+pub async fn enqueue_with_max_attempts(
+    pool: &PgPool,
+    kind: &str,
+    payload: serde_json::Value,
+    max_attempts: i32,
+) -> AppResult<i64> {
+    if !(1..=32).contains(&max_attempts) {
+        return Err(utopia_core::AppError::Validation(
+            "max_attempts must be between 1 and 32".into(),
+        ));
+    }
+    let (id,): (i64,) = sqlx::query_as(
+        "INSERT INTO jobs (kind, payload, max_attempts) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(kind)
+    .bind(payload)
+    .bind(max_attempts)
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
+/// 与 ledger 变更共用事务；不能先写 job、再写 entry，否则进程退出窗口会留下
+/// 一个无法从 entry 找到的 hydration 任务。
+pub async fn enqueue_with_max_attempts_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    kind: &str,
+    payload: serde_json::Value,
+    max_attempts: i32,
+) -> AppResult<i64> {
+    if !(1..=32).contains(&max_attempts) {
+        return Err(utopia_core::AppError::Validation(
+            "max_attempts must be between 1 and 32".into(),
+        ));
+    }
+    let (id,): (i64,) = sqlx::query_as(
+        "INSERT INTO jobs (kind, payload, max_attempts) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(kind)
+    .bind(payload)
+    .bind(max_attempts)
+    .fetch_one(&mut **tx)
+    .await?;
     Ok(id)
 }
 

@@ -6,6 +6,7 @@
 
 use crate::state::AppState;
 use chrono::{DateTime, Utc};
+use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use utopia_core::models::Source;
 use utopia_core::models::SourceKind;
@@ -13,6 +14,9 @@ use uuid::Uuid;
 
 /// 单次同步的新文档上限（防超长 feed/URL 列表拖垮任务）
 const MAX_NEW_PER_SYNC: usize = 200;
+const MAX_FEED_BYTES: usize = 4 * 1024 * 1024;
+const RSS_MAX_INFLIGHT: i64 = 25;
+const RSS_HYDRATION_ATTEMPTS: i32 = 5;
 
 /// 抓取用的 User-Agent。reqwest 默认一个都不发，而维基百科明确拒绝匿名请求
 /// （403），Cloudflare 前置的站点也普遍如此——URL 与 RSS 两类来源因此对一大批
@@ -28,6 +32,20 @@ const UA: &str = concat!(
 pub struct SyncStats {
     pub created: usize,
     pub updated: usize,
+    pub discovered: usize,
+    pub queued_for_content: usize,
+    pub content_terminal: usize,
+}
+
+#[derive(Debug)]
+struct RssObservation {
+    key: String,
+    title: String,
+    article_url: Option<String>,
+    summary: String,
+    embedded_html: Option<String>,
+    doc_time: Option<DateTime<Utc>>,
+    has_usable_source: bool,
 }
 
 impl SyncStats {
@@ -82,7 +100,16 @@ pub async fn sync_source(state: &AppState, source_id: Uuid) -> anyhow::Result<()
             utopia_store::sources::finish_sync(&state.pool, source_id, None, stats.total() as i32)
                 .await?;
             state.emit_source(source.kb_id);
-            tracing::info!(%source_id, kind = %source.kind, created = stats.created, updated = stats.updated, "来源同步完成");
+            tracing::info!(
+                %source_id,
+                kind = %source.kind,
+                created = stats.created,
+                updated = stats.updated,
+                discovered = stats.discovered,
+                queued_for_content = stats.queued_for_content,
+                content_terminal = stats.content_terminal,
+                "来源同步完成"
+            );
             Ok(())
         }
         Err(e) => {
@@ -112,6 +139,12 @@ pub enum IngestAction {
     Unchanged,
     /// 墓碑：标记"不在来源中"（不删除文档，删不删由用户在 UI 决定）
     Tombstoned,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct IngestOutcome {
+    pub action: IngestAction,
+    pub document_id: Option<Uuid>,
 }
 
 async fn write_blob(state: &AppState, sha256: &str, bytes: &[u8]) -> anyhow::Result<()> {
@@ -168,11 +201,7 @@ pub async fn ingest_upload(
     }
 }
 
-/// 身份感知摄入：按 (source, external_key) 三路判定——
-/// 新增（建文档）/ 变更（原地替换 + 版本记录 + 重跑管道）/ 未变（跳过）；
-/// 同内容换路径识别为移动（只改身份，不重跑）。external_key 为 URI 形态
-/// （file:/// 相对路径、页面 URL、rss guid、api:{id}），出处自描述，
-/// 也为 P5 SPARQL 投影的文档 IRI 提前对齐。
+/// Existing callers only need the action; hydration also needs the stable document UUID.
 #[allow(clippy::too_many_arguments)]
 pub async fn ingest_item(
     state: &AppState,
@@ -184,8 +213,36 @@ pub async fn ingest_item(
     bytes: &[u8],
     doc_time: Option<DateTime<Utc>>,
 ) -> anyhow::Result<IngestAction> {
+    Ok(ingest_item_with_outcome(
+        state,
+        kb_id,
+        source_id,
+        external_key,
+        filename,
+        mime,
+        bytes,
+        doc_time,
+    )
+    .await?
+    .action)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn ingest_item_with_outcome(
+    state: &AppState,
+    kb_id: Uuid,
+    source_id: Uuid,
+    external_key: &str,
+    filename: &str,
+    mime: &str,
+    bytes: &[u8],
+    doc_time: Option<DateTime<Utc>>,
+) -> anyhow::Result<IngestOutcome> {
     if bytes.is_empty() {
-        return Ok(IngestAction::Unchanged);
+        return Ok(IngestOutcome {
+            action: IngestAction::Unchanged,
+            document_id: None,
+        });
     }
     let sha256 = sha_hex(bytes);
 
@@ -213,11 +270,14 @@ pub async fn ingest_item(
 
     if let Some(doc) = existing {
         if doc.sha256 == sha256 {
-            return Ok(IngestAction::Unchanged);
+            return Ok(IngestOutcome {
+                action: IngestAction::Unchanged,
+                document_id: Some(doc.id),
+            });
         }
-        // 变更：原地替换，旧版本入 document_versions（blob 内容寻址不删，回放有料）
+        // 变更：原地替换，旧版本入 document_versions，并与处理任务一起提交
         write_blob(state, &sha256, bytes).await?;
-        utopia_store::documents::replace_content(
+        utopia_store::documents::replace_content_and_enqueue_processing(
             &state.pool,
             doc.id,
             filename,
@@ -227,16 +287,11 @@ pub async fn ingest_item(
             doc_time,
         )
         .await?;
-        utopia_store::documents::record_version(&state.pool, doc.id, &sha256, bytes.len() as i64)
-            .await?;
-        utopia_store::jobs::enqueue(
-            &state.pool,
-            "process_document",
-            serde_json::json!({ "document_id": doc.id }),
-        )
-        .await?;
         state.emit_document(kb_id, doc.id);
-        return Ok(IngestAction::Updated);
+        return Ok(IngestOutcome {
+            action: IngestAction::Updated,
+            document_id: Some(doc.id),
+        });
     }
 
     // 同内容出现在新路径：识别为移动/改名，不重跑管道
@@ -246,7 +301,10 @@ pub async fn ingest_item(
         utopia_store::documents::update_location(&state.pool, doc.id, filename, external_key)
             .await?;
         state.emit_document(kb_id, doc.id);
-        return Ok(IngestAction::Moved);
+        return Ok(IngestOutcome {
+            action: IngestAction::Moved,
+            document_id: Some(doc.id),
+        });
     }
 
     write_blob(state, &sha256, bytes).await?;
@@ -278,10 +336,21 @@ pub async fn ingest_item(
             )
             .await?;
             state.emit_document(kb_id, doc.id);
-            Ok(IngestAction::Created)
+            Ok(IngestOutcome {
+                action: IngestAction::Created,
+                document_id: Some(doc.id),
+            })
         }
-        // KB 内已有同内容（如手动上传过同一文件）：不重复摄入
-        Err(utopia_core::AppError::Conflict(_)) => Ok(IngestAction::Unchanged),
+        // KB 内已有同内容（如手动上传过同一文件）：返回真正的文档 ID，不伪造身份
+        Err(utopia_core::AppError::Conflict(_)) => {
+            let document_id = utopia_store::documents::find_by_kb_sha(&state.pool, kb_id, &sha256)
+                .await?
+                .map(|doc| doc.id);
+            Ok(IngestOutcome {
+                action: IngestAction::Unchanged,
+                document_id,
+            })
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -396,11 +465,94 @@ fn filename_from_url(url: &str, mime: &str) -> String {
     }
 }
 
+async fn read_bounded_response(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        anyhow::bail!("response body exceeds configured bound");
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            anyhow::bail!("response body exceeds configured bound");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn rss_article_link(entry: &feed_rs::model::Entry) -> Option<String> {
+    entry.links.iter().find_map(|link| {
+        let rel_is_alternate = link
+            .rel
+            .as_deref()
+            .is_none_or(|rel| rel.eq_ignore_ascii_case("alternate"));
+        if !rel_is_alternate {
+            return None;
+        }
+        if link.media_type.as_deref().is_some_and(|media| {
+            !media.eq_ignore_ascii_case("text/html")
+                && !media.eq_ignore_ascii_case("application/xhtml+xml")
+        }) {
+            return None;
+        }
+        let parsed = reqwest::Url::parse(link.href.trim()).ok()?;
+        match parsed.scheme() {
+            "http" | "https" if parsed.host().is_some() => Some(parsed.to_string()),
+            _ => None,
+        }
+    })
+}
+
+fn rss_entry_key(entry: &feed_rs::model::Entry, article_url: Option<&str>) -> Option<String> {
+    if !entry.id.trim().is_empty() {
+        return Some(entry.id.trim().to_string());
+    }
+    article_url.map(str::to_owned)
+}
+
+fn content_is_substantive(markdown: &str, summary: &str, linked_page: bool) -> bool {
+    crate::rss_full_content::quality_check(markdown, summary, linked_page).is_ok()
+}
+
+fn has_usable_rss_content(feed_usable: bool, article_url: Option<&str>, summary: &str) -> bool {
+    feed_usable
+        || article_url.is_some_and(|url| !url.trim().is_empty())
+        || !summary.trim().is_empty()
+}
+
 async fn sync_rss(state: &AppState, source: &Source) -> anyhow::Result<SyncStats> {
     let feed_url = source.config["feed_url"]
         .as_str()
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("rss source is missing config.feed_url"))?;
+    let content_mode = utopia_store::sources::rss_content_mode(&source.config)?;
 
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -410,50 +562,141 @@ async fn sync_rss(state: &AppState, source: &Source) -> anyhow::Result<SyncStats
     if !resp.status().is_success() {
         anyhow::bail!("HTTP {} fetching feed", resp.status());
     }
-    let bytes = resp.bytes().await?;
+    let bytes = read_bounded_response(resp, MAX_FEED_BYTES).await?;
     let feed = feed_rs::parser::parse(&bytes[..])
         .map_err(|e| anyhow::anyhow!("Failed to parse feed: {e}"))?;
 
-    let mut stats = SyncStats::default();
-    for entry in feed.entries.iter().take(MAX_NEW_PER_SYNC) {
-        let title = entry
-            .title
-            .as_ref()
-            .map(|t| t.content.clone())
-            .unwrap_or_else(|| "untitled".into());
-        let link = entry
-            .links
-            .first()
-            .map(|l| l.href.clone())
-            .unwrap_or_default();
-        // 逻辑身份：feed 规范的 guid（通常已是 permalink/urn），缺失时退条目链接
-        let key = if !entry.id.trim().is_empty() {
-            entry.id.trim().to_string()
-        } else if !link.is_empty() {
-            link.clone()
-        } else {
-            format!("entry:{}", sha_hex(title.as_bytes()))
-        };
-        let body = entry
-            .content
-            .as_ref()
-            .and_then(|c| c.body.clone())
-            .or_else(|| entry.summary.as_ref().map(|s| s.content.clone()))
-            .unwrap_or_default();
-        // 条目发布时间 → 文档时间：时态抽取吃到真实时间戳（本平台的差异化正在于此）
-        let doc_time = entry.published.or(entry.updated);
+    let observations: Vec<RssObservation> = feed
+        .entries
+        .iter()
+        .take(MAX_NEW_PER_SYNC)
+        .filter_map(|entry| {
+            let title = entry
+                .title
+                .as_ref()
+                .map(|t| t.content.trim().to_string())
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| "untitled".into());
+            let article_url = rss_article_link(entry);
+            let key = rss_entry_key(entry, article_url.as_deref())?;
+            let embedded_html = entry
+                .content
+                .as_ref()
+                .and_then(|content| content.body.as_deref())
+                .map(str::trim)
+                .filter(|body| !body.is_empty())
+                .map(|body| truncate_utf8(body, 2 * 1024 * 1024));
+            let summary = entry
+                .summary
+                .as_ref()
+                .map(|summary| summary.content.trim().to_string())
+                .unwrap_or_default();
+            let embedded_markdown = embedded_html
+                .as_deref()
+                .and_then(|html| crate::rss_full_content::normalize_feed_html(html).ok());
+            let feed_usable = embedded_markdown
+                .as_deref()
+                .is_some_and(|markdown| content_is_substantive(markdown, &summary, false));
+            let usable_source =
+                has_usable_rss_content(feed_usable, article_url.as_deref(), &summary);
+            Some(RssObservation {
+                key,
+                title,
+                article_url,
+                summary,
+                embedded_html,
+                doc_time: entry.published.or(entry.updated),
+                has_usable_source: usable_source,
+            })
+        })
+        .collect();
 
-        let html = format!(
-            "<html><head><title>{}</title></head><body><h1>{}</h1>\n<p><a href=\"{}\">{}</a></p>\n{}</body></html>",
-            title, title, link, link, body
-        );
-        let mut slug: String = title
-            .chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+    if content_mode == utopia_store::sources::RSS_FULL_CONTENT_MODE {
+        let activation = utopia_store::rss_full_content::get_activation(&state.pool, source.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("RSS full-content activation is missing"))?;
+        let entries: Vec<utopia_store::rss_full_content::NewEntry> = observations
+            .iter()
+            .map(|observation| utopia_store::rss_full_content::NewEntry {
+                external_key: truncate_utf8(&observation.key, 4_096),
+                title: truncate_utf8(&observation.title, 2_048),
+                article_url: observation
+                    .article_url
+                    .as_deref()
+                    .map(|url| truncate_utf8(url, 8_192)),
+                summary: truncate_utf8(&observation.summary, 16_384),
+                embedded_html: observation.embedded_html.clone(),
+                doc_time: observation.doc_time,
+                has_usable_source: observation.has_usable_source,
+            })
             .collect();
-        slug.truncate(80);
-        let filename = format!("{slug}.html");
 
+        if activation.activation_state == "pending" {
+            let discovered = utopia_store::rss_full_content::record_baseline(
+                &state.pool,
+                source.id,
+                activation.activation_generation,
+                &entries,
+            )
+            .await?;
+            return Ok(SyncStats {
+                discovered,
+                ..SyncStats::default()
+            });
+        }
+        if activation.activation_state != "active" {
+            anyhow::bail!("RSS full-content activation is disabled");
+        }
+
+        let discovered = utopia_store::rss_full_content::discover(
+            &state.pool,
+            source.id,
+            activation.activation_generation,
+            &entries,
+        )
+        .await?;
+        let queued = utopia_store::rss_full_content::claim_pending_and_enqueue(
+            &state.pool,
+            source.id,
+            activation.activation_generation,
+            RSS_MAX_INFLIGHT,
+            RSS_HYDRATION_ATTEMPTS,
+        )
+        .await?;
+        return Ok(SyncStats {
+            discovered: discovered.discovered,
+            queued_for_content: queued,
+            content_terminal: discovered.terminal,
+            ..SyncStats::default()
+        });
+    }
+
+    let mut stats = SyncStats::default();
+    for observation in observations {
+        let RssObservation {
+            key,
+            title,
+            article_url,
+            summary,
+            embedded_html,
+            doc_time,
+            ..
+        } = observation;
+        let body = embedded_html.unwrap_or(summary);
+        let safe_title = escape_html(&title);
+        let safe_link = article_url.as_deref().map(escape_html).unwrap_or_default();
+        let html = format!(
+            "<html><head><title>{safe_title}</title></head><body><h1>{safe_title}</h1>\n<p><a href=\"{safe_link}\">{safe_link}</a></p>\n{body}</body></html>",
+        );
+        let slug = {
+            let slug = slugify(&title);
+            if slug.is_empty() {
+                "untitled".to_string()
+            } else {
+                slug
+            }
+        };
+        let filename = format!("{slug}.html");
         let action = ingest_item(
             state,
             source.kb_id,
@@ -916,4 +1159,21 @@ fn ensure_extension(title: &str, mime: &str) -> String {
         "md"
     };
     format!("{title}.{ext}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_usable_rss_content;
+
+    #[test]
+    fn summary_makes_an_rss_entry_hydratable_without_an_article_link() {
+        assert!(has_usable_rss_content(false, None, "A useful summary."));
+        assert!(has_usable_rss_content(
+            false,
+            Some("https://example.com/a"),
+            ""
+        ));
+        assert!(has_usable_rss_content(true, None, ""));
+        assert!(!has_usable_rss_content(false, None, "   "));
+    }
 }

@@ -26,6 +26,7 @@ sqlx.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 argon2.workspace = true
@@ -35,6 +36,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 flate2.workspace = true
 reqwest.workspace = true
+dom_smoothie.workspace = true
+htmd.workspace = true
 
 feed-rs.workspace = true
 async-trait = "0.1.92"

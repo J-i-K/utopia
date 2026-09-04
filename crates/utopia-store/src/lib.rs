@@ -23,6 +23,7 @@ pub mod pending;
 pub mod reasoning;
 pub mod resolution;
 pub mod review;
+pub mod rss_full_content;
 pub mod settings;
 pub mod sources;
 pub mod temporal;
