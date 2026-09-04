@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { Lock, Plus, X } from "lucide-react";
-import { api } from "../api";
+import { api, type ChatAccessMode } from "../api";
 import { LANG_NAMES, S } from "../i18n";
 import { useKb } from "../kb";
 import { toast } from "../toast";
@@ -722,6 +722,19 @@ function DataSourcesAdmin() {
   );
 }
 
+function isOpenAiBaseUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      url.hostname === "api.openai.com" &&
+      url.port === ""
+    );
+  } catch {
+    return false;
+  }
+}
+
 const PRESETS: Record<
   string,
   { chat: string; embed: string; chatModel: string; embedModel: string }
@@ -775,6 +788,7 @@ export function Settings() {
     chat_base_url: "",
     chat_api_key: "",
     chat_model: "",
+    chat_access_mode: "api" as ChatAccessMode,
     embed_base_url: "",
     embed_api_key: "",
     embed_model: "",
@@ -786,6 +800,10 @@ export function Settings() {
         ...f,
         chat_base_url: settings.data.chat_base_url ?? "",
         chat_model: settings.data.chat_model ?? "",
+        chat_access_mode:
+          settings.data.chat_access_mode === "subscription"
+            ? "subscription"
+            : "api",
         embed_base_url: settings.data.embed_base_url ?? "",
         embed_model: settings.data.embed_model ?? "",
       }));
@@ -811,6 +829,8 @@ export function Settings() {
 
   const input = "input-dark w-full px-3 py-2 text-sm";
   const label = "block text-xs font-medium text-neutral-400 mb-1";
+  const openAiChat = isOpenAiBaseUrl(form.chat_base_url);
+  const subscriptionAvailable = settings.data?.subscription_available === true;
 
   return (
     <div className="h-full overflow-y-auto p-6">
@@ -862,6 +882,7 @@ export function Settings() {
                       ...form,
                       chat_base_url: p.chat,
                       chat_model: p.chatModel,
+                      chat_access_mode: "api",
                       embed_base_url: p.embed,
                       embed_model: p.embedModel,
                     })
@@ -886,6 +907,48 @@ export function Settings() {
                   onChange={set("chat_base_url")}
                 />
               </div>
+              {openAiChat ? (
+                <div>
+                  <label className={label} htmlFor="chat-access-mode">
+                    {S.settings.chatAccessMode}
+                  </label>
+                  <select
+                    id="chat-access-mode"
+                    className={input}
+                    value={form.chat_access_mode}
+                    onChange={(e) =>
+                      setForm({
+                        ...form,
+                        chat_access_mode: e.target.value as ChatAccessMode,
+                      })
+                    }
+                  >
+                    <option value="api">{S.settings.chatAccessApi}</option>
+                    <option
+                      value="subscription"
+                      disabled={!subscriptionAvailable}
+                    >
+                      {S.settings.chatAccessSubscription}
+                    </option>
+                  </select>
+                  <p className="mt-1 text-[11px] leading-relaxed text-neutral-500">
+                    {form.chat_access_mode === "subscription"
+                      ? S.settings.chatAccessSubscriptionHint
+                      : S.settings.chatAccessApiHint}
+                  </p>
+                  {!subscriptionAvailable && (
+                    <p className="mt-1 text-[11px] leading-relaxed text-amber-400/80">
+                      {S.settings.chatAccessUnavailable}
+                    </p>
+                  )}
+                </div>
+              ) : (
+                form.chat_access_mode === "subscription" && (
+                  <p className="text-[11px] leading-relaxed text-amber-400/80">
+                    {S.settings.chatAccessRequiresOpenai}
+                  </p>
+                )
+              )}
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className={label}>{S.settings.model}</label>
@@ -958,7 +1021,11 @@ export function Settings() {
               <div className="flex gap-2 pt-2">
                 <button
                   onClick={() => save.mutate()}
-                  disabled={save.isPending}
+                  disabled={
+                    save.isPending ||
+                    (form.chat_access_mode === "subscription" &&
+                      !subscriptionAvailable)
+                  }
                   className="u-btn u-btn-primary px-4 py-2 text-sm"
                 >
                   {save.isPending ? S.settings.saving : S.settings.save}

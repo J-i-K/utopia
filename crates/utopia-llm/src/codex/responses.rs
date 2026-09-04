@@ -51,6 +51,22 @@ impl CodexResponsesClient {
         Self::build(auth, model.into(), base_url.into())
     }
 
+    /// Reuse the authenticated transport while selecting the model from workspace settings.
+    pub fn for_model(&self, model: impl Into<String>) -> Result<Self, BackgroundTextError> {
+        let model = model.into();
+        if model.trim().is_empty() {
+            return Err(BackgroundTextError::InvalidInput(
+                "Codex model is empty".into(),
+            ));
+        }
+        Ok(Self {
+            auth: Arc::clone(&self.auth),
+            http: self.http.clone(),
+            base_url: self.base_url.clone(),
+            model,
+        })
+    }
+
     fn build(
         auth: Arc<CodexAuthManager>,
         model: String,
@@ -631,6 +647,17 @@ mod tests {
                 content: "user bytes".into(),
             },
         ]
+    }
+
+    #[test]
+    fn selected_model_can_reuse_the_same_subscription_transport() {
+        let (_dir, auth) = client_fixture(None);
+        let client =
+            CodexResponsesClient::with_base_url(auth, "deployment-default", "https://example.test")
+                .unwrap();
+        let selected = client.for_model("workspace-selected").unwrap();
+        assert_eq!(selected.identity().model, "workspace-selected");
+        assert_eq!(selected.identity().endpoint_key, "https://example.test");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use sqlx::PgPool;
-use utopia_core::models::LlmSettings;
+use utopia_core::models::{ChatAccessMode, LlmSettings};
 use utopia_core::AppResult;
 use uuid::Uuid;
 
@@ -32,6 +32,7 @@ pub async fn upsert(
     chat_base_url: Option<&str>,
     chat_api_key: Option<&str>,
     chat_model: Option<&str>,
+    chat_access_mode: Option<ChatAccessMode>,
     embed_base_url: Option<&str>,
     embed_api_key: Option<&str>,
     embed_model: Option<&str>,
@@ -39,13 +40,14 @@ pub async fn upsert(
 ) -> AppResult<LlmSettings> {
     let row = sqlx::query_as(
         "INSERT INTO llm_settings
-             (workspace_id, chat_base_url, chat_api_key, chat_model,
+             (workspace_id, chat_base_url, chat_api_key, chat_model, chat_access_mode,
               embed_base_url, embed_api_key, embed_model, embed_dim, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+         VALUES ($1, $2, $3, $4, COALESCE($5, 'api'), $6, $7, $8, $9, now())
          ON CONFLICT (workspace_id) DO UPDATE SET
              chat_base_url  = EXCLUDED.chat_base_url,
              chat_api_key   = COALESCE(EXCLUDED.chat_api_key, llm_settings.chat_api_key),
              chat_model     = EXCLUDED.chat_model,
+             chat_access_mode = COALESCE(EXCLUDED.chat_access_mode, llm_settings.chat_access_mode),
              embed_base_url = EXCLUDED.embed_base_url,
              embed_api_key  = COALESCE(EXCLUDED.embed_api_key, llm_settings.embed_api_key),
              embed_model    = EXCLUDED.embed_model,
@@ -57,6 +59,7 @@ pub async fn upsert(
     .bind(chat_base_url)
     .bind(chat_api_key)
     .bind(chat_model)
+    .bind(chat_access_mode.map(ChatAccessMode::as_str))
     .bind(embed_base_url)
     .bind(embed_api_key)
     .bind(embed_model)

@@ -38,7 +38,8 @@ pub struct AppConfig {
     pub cookie_secure: bool,
     /// 是否开放注册。false 时仅首个用户（引导部署）可注册，其余需管理员开放。
     pub open_registration: bool,
-    /// Deployment-wide background text provider. Interactive chat and embeddings do not use it.
+    /// Deployment-wide capability gate for workspace-selected background transport.
+    /// Interactive chat and embeddings do not use it.
     #[serde(default)]
     pub background_llm_provider: BackgroundLlmProvider,
     /// Required only when `background_llm_provider=codex_responses`.
@@ -143,5 +144,20 @@ mod tests {
             serde_json::from_value::<BackgroundLlmProvider>(serde_json::json!("arbitrary_host"))
                 .unwrap_err();
         assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn chat_access_mode_wire_values_are_stable_and_closed() {
+        use crate::models::ChatAccessMode;
+
+        assert_eq!(
+            serde_json::to_string(&ChatAccessMode::Api).unwrap(),
+            "\"api\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ChatAccessMode::Subscription).unwrap(),
+            "\"subscription\""
+        );
+        assert!(serde_json::from_str::<ChatAccessMode>("\"responses\"").is_err());
     }
 }

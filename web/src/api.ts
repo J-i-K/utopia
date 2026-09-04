@@ -214,9 +214,24 @@ export interface SearchResult {
   filename: string;
 }
 
+export type ChatAccessMode = "api" | "subscription";
+
+export interface LlmSettingsUpdate {
+  chat_base_url: string;
+  chat_api_key: string;
+  chat_model: string;
+  chat_access_mode: ChatAccessMode;
+  embed_base_url: string;
+  embed_api_key: string;
+  embed_model: string;
+  embed_dim?: number | null;
+}
+
 export interface LlmSettingsView {
   chat_base_url?: string | null;
   chat_model?: string | null;
+  chat_access_mode?: ChatAccessMode;
+  subscription_available?: boolean;
   has_chat_key?: boolean;
   embed_base_url?: string | null;
   embed_model?: string | null;
@@ -1355,7 +1370,7 @@ export const api = {
 
   settings: (workspaceId: string) =>
     request<LlmSettingsView>(`/api/v1/workspaces/${workspaceId}/settings`),
-  saveSettings: (workspaceId: string, body: Record<string, unknown>) =>
+  saveSettings: (workspaceId: string, body: LlmSettingsUpdate) =>
     request<{ ok: boolean }>(`/api/v1/workspaces/${workspaceId}/settings`, {
       method: "PUT",
       body: JSON.stringify(body),

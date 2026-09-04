@@ -6,11 +6,19 @@
 
 > A ChatGPT subscription is not an OpenAI-compatible API key. Utopia's existing Chat Completions client is the right default for interactive chat, tools, and embeddings; it is the wrong abstraction for a subscription-backed Codex Responses session. The two transports therefore remain separate, and only the two background text workloads may opt into the new one.
 
-## The switch belongs to the deployment
+## The capability belongs to the deployment; the model choice belongs to the workspace
 
-The provider choice is `UTOPIA_BACKGROUND_LLM_PROVIDER`, with `chat_completions` as the default. `codex_responses` is a deployment-wide opt-in, not a workspace setting. The credential belongs to the deployment; exposing a selector to workspace administrators would turn a personal or single-deployment subscription into an implicit tenant capability.
+The deployment setting `UTOPIA_BACKGROUND_LLM_PROVIDER` is the capability gate, with
+`chat_completions` as the default. `codex_responses` enables the explicitly provisioned
+subscription transport. Once that capability is enabled, the existing workspace-scoped Models
+selector can choose `api` (OpenAI-compatible Chat Completions) or `subscription` (Codex
+Responses) for that workspace's background extraction and adjudication. The credential still
+belongs to the deployment; workspace administrators never enter or receive it.
 
-The background seam returns only complete plain text and a non-secret provider/model identity. It does not expose tools, streamed interactive turns, provider-managed conversation state, images, or `previous_response_id`. Interactive chat continues to construct the existing Chat Completions client, and embeddings continue to use the independently configured `/embeddings` path.
+The selector is limited to the exact OpenAI API host. Other OpenAI-compatible providers remain
+on Chat Completions, and a subscription selection cannot be saved unless the deployment
+capability is enabled. Interactive chat, tools, ontology/type resolution, and embeddings remain
+on their existing paths.
 
 ## Responses is not a renamed Chat Completions endpoint
 
@@ -39,7 +47,7 @@ Extraction still owns the existing capped rate-limit backoff. The model permit i
 
 Adjudication still validates a complete verdict batch before writing any verdict or performing an automatic merge. Indices must cover the requested batch exactly once and stay in range. The existing confidence thresholds, review escalation, conflict handling, audit records, and durable retry budget remain in force. The persisted model identity retains the raw Chat Completions model value and uses `codex_responses:<model>` for Codex results. Cache keys remain provider-agnostic so existing verdicts can be reused after a provider switch; only new Codex writes receive qualified provenance.
 
-There is no automatic cross-provider fallback within a job. Mixing providers silently would make provenance, retry accounting, and operator decisions ambiguous. Rollback is an explicit configuration action: remove the Codex overlay or set `UTOPIA_BACKGROUND_LLM_PROVIDER=chat_completions`, restart only under authorization, and verify background Chat Completions, interactive chat, and embeddings separately.
+There is no automatic cross-provider fallback within a job. Mixing providers silently would make provenance, retry accounting, and operator decisions ambiguous. Rollback is explicit: select **OpenAI API · Chat Completions** for affected workspaces, then remove the Codex overlay or set `UTOPIA_BACKGROUND_LLM_PROVIDER=chat_completions` and restart only under authorization. Existing Chat Completions workspace settings remain the rollback path; no source revert is required.
 
 ## Security boundary and open gate
 

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use utopia_core::config::{AppConfig, BackgroundLlmProvider};
-use utopia_core::models::LlmSettings;
+use utopia_core::models::{ChatAccessMode, LlmSettings};
 use utopia_llm::{BackgroundTextClient, ChatMessage, LlmClient};
 
 use crate::state::AppState;
@@ -33,10 +33,9 @@ pub fn embed_client(s: &LlmSettings) -> Option<LlmClient> {
     ))
 }
 
-/// Deployment-scoped background provider. Interactive chat never reads this object.
+/// Deployment-scoped background capability. Interactive chat never reads this object.
 #[derive(Clone)]
 pub struct BackgroundRuntime {
-    provider: BackgroundLlmProvider,
     codex_client: Option<Arc<utopia_llm::CodexResponsesClient>>,
     codex_gate: Option<Arc<Semaphore>>,
 }
@@ -46,7 +45,6 @@ impl BackgroundRuntime {
         cfg.validate()?;
         match cfg.background_llm_provider {
             BackgroundLlmProvider::ChatCompletions => Ok(Self {
-                provider: BackgroundLlmProvider::ChatCompletions,
                 codex_client: None,
                 codex_gate: None,
             }),
@@ -62,7 +60,6 @@ impl BackgroundRuntime {
                 let auth = Arc::new(utopia_llm::CodexAuthManager::new(home)?);
                 let client = Arc::new(utopia_llm::CodexResponsesClient::new(auth, model)?);
                 Ok(Self {
-                    provider: BackgroundLlmProvider::CodexResponses,
                     codex_client: Some(client),
                     codex_gate: Some(Arc::new(Semaphore::new(cfg.codex_max_concurrency as usize))),
                 })
@@ -70,19 +67,23 @@ impl BackgroundRuntime {
         }
     }
 
+    pub fn subscription_available(&self) -> bool {
+        self.codex_client.is_some()
+    }
+
     pub fn ready(&self, settings: Option<&LlmSettings>) -> bool {
         self.client(settings).is_some()
     }
 
     pub fn client(&self, settings: Option<&LlmSettings>) -> Option<BackgroundTextClient> {
-        match self.provider {
-            BackgroundLlmProvider::ChatCompletions => settings
-                .and_then(chat_client)
-                .map(BackgroundTextClient::ChatCompletions),
-            BackgroundLlmProvider::CodexResponses => self
-                .codex_client
-                .clone()
-                .map(|client| BackgroundTextClient::CodexResponses((*client).clone())),
+        let settings = settings?;
+        match settings.chat_access_mode {
+            ChatAccessMode::Api => chat_client(settings).map(BackgroundTextClient::ChatCompletions),
+            ChatAccessMode::Subscription => {
+                let model = settings.chat_model.as_deref()?.trim();
+                let client = self.codex_client.as_ref()?.for_model(model).ok()?;
+                Some(BackgroundTextClient::CodexResponses(client))
+            }
         }
     }
 
@@ -199,6 +200,100 @@ pub async fn acquire_chat(state: &AppState, s: &LlmSettings) -> Option<OwnedSema
 pub async fn acquire_embed(state: &AppState, s: &LlmSettings) -> Option<OwnedSemaphorePermit> {
     let (base, model) = (s.embed_base_url.as_deref()?, s.embed_model.as_deref()?);
     acquire(state, base, model).await
+}
+
+#[cfg(test)]
+mod background_selection_tests {
+    use super::*;
+    use chrono::Utc;
+    use serde_json::json;
+    use std::fs;
+    use utopia_core::models::{ChatAccessMode, LlmSettings};
+    use utopia_llm::BackgroundTextClient;
+
+    fn settings(mode: ChatAccessMode) -> LlmSettings {
+        LlmSettings {
+            workspace_id: uuid::Uuid::nil(),
+            chat_base_url: Some("https://api.openai.com/v1".into()),
+            chat_api_key: Some("api-fixture".into()),
+            chat_model: Some("workspace-model".into()),
+            chat_access_mode: mode,
+            embed_base_url: None,
+            embed_api_key: None,
+            embed_model: None,
+            embed_dim: None,
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn codex_home() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(
+            dir.path().join("auth.json"),
+            json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "access-fixture",
+                    "refresh_token": "refresh-fixture",
+                    "id_token": "id-fixture",
+                    "account_id": "account-fixture"
+                },
+                "last_refresh": "2099-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                dir.path().join("auth.json"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn workspace_access_mode_selects_background_transport_without_changing_chat() {
+        let api_settings = settings(ChatAccessMode::Api);
+        let subscription_settings = settings(ChatAccessMode::Subscription);
+        let api_runtime = BackgroundRuntime::from_config(&AppConfig::default()).unwrap();
+
+        assert!(matches!(
+            api_runtime.client(Some(&api_settings)),
+            Some(BackgroundTextClient::ChatCompletions(_))
+        ));
+        assert!(api_runtime.client(Some(&subscription_settings)).is_none());
+        assert!(chat_client(&subscription_settings).is_some());
+    }
+
+    #[test]
+    fn subscription_mode_uses_the_workspace_selected_model_when_enabled() {
+        let home = codex_home();
+        let mut cfg = AppConfig {
+            background_llm_provider: BackgroundLlmProvider::CodexResponses,
+            codex_model: Some("deployment-default".into()),
+            codex_home: Some(home.path().to_string_lossy().into_owned()),
+            ..AppConfig::default()
+        };
+        cfg.codex_max_concurrency = 1;
+        let runtime = BackgroundRuntime::from_config(&cfg).unwrap();
+        let client = runtime.client(Some(&settings(ChatAccessMode::Subscription)));
+
+        match client {
+            Some(BackgroundTextClient::CodexResponses(client)) => {
+                assert_eq!(client.identity().model, "workspace-model");
+            }
+            _ => panic!("expected the selected workspace model to use Codex Responses"),
+        }
+    }
 }
 
 #[cfg(test)]

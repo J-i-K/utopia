@@ -33,7 +33,7 @@ pub struct AppState {
     pub worker_concurrency: Arc<std::sync::atomic::AtomicUsize>,
     /// 按模型的并发闸门：后台任务调 LLM 前取许可。限额存库，改完即时生效
     pub model_gates: Arc<crate::llm_util::ModelGates>,
-    /// Deployment-scoped background provider and its fixed Codex gate, if enabled.
+    /// Deployment-scoped background capability and its fixed Codex gate, if enabled.
     pub background: Arc<crate::llm_util::BackgroundRuntime>,
     pub events: broadcast::Sender<AppEvent>,
     /// 正在生成的回答，按会话查。**刷新页面之后还能接上**（见 `live`）

@@ -858,6 +858,17 @@ export const zh: Strings = {
     modelsIntro:
       "OpenAI 兼容协议——DeepSeek、Qwen、GLM、Ollama、vLLM 都可用。完全内网友好。",
     chatModel: "对话模型",
+    chatAccessMode: "后台访问方式",
+    chatAccessApi: "OpenAI API · Chat Completions",
+    chatAccessSubscription: "ChatGPT 订阅 · Responses",
+    chatAccessApiHint:
+      "后台抽取与消解使用上面的 API 密钥。交互式对话始终使用 Chat Completions。",
+    chatAccessSubscriptionHint:
+      "后台抽取与消解使用本部署明确配置的 ChatGPT 订阅凭据。交互式对话仍使用 Chat Completions。",
+    chatAccessUnavailable:
+      "本部署尚未启用订阅访问。请先由管理员配置 Codex 凭据 overlay。",
+    chatAccessRequiresOpenai:
+      "只有对话接口地址使用精确的 https://api.openai.com 主机时才能使用订阅模式（预置值为 /v1）。",
     embedModel: "向量模型（可选，启用语义检索）",
     baseUrl: "接口地址",
     model: "模型",

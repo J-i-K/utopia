@@ -943,6 +943,17 @@ export const en = {
     modelsIntro:
       "OpenAI-compatible protocol — DeepSeek, Qwen, GLM, Ollama, vLLM all work. Fully on-prem friendly.",
     chatModel: "Chat model",
+    chatAccessMode: "Background access",
+    chatAccessApi: "OpenAI API · Chat Completions",
+    chatAccessSubscription: "ChatGPT subscription · Responses",
+    chatAccessApiHint:
+      "Uses the API key above for background extraction and adjudication. Interactive chat always uses Chat Completions.",
+    chatAccessSubscriptionHint:
+      "Uses this deployment's explicitly configured ChatGPT subscription credentials for background extraction and adjudication. Interactive chat remains on Chat Completions.",
+    chatAccessUnavailable:
+      "Subscription access is not enabled for this deployment. An administrator must configure the Codex credential overlay first.",
+    chatAccessRequiresOpenai:
+      "Subscription mode is available only when the chat base URL uses the exact https://api.openai.com host (the preset is /v1).",
     embedModel: "Embedding model (optional, enables semantic search)",
     baseUrl: "Base URL",
     model: "Model",
