@@ -110,8 +110,9 @@ async fn repeated_discovery_is_idempotent_and_claiming_is_capped_at_twenty_five(
     let pool = PgPool::connect(&url).await?;
     let (org_id, _kb_id, source_id, _workspace_id) = seed_source(&pool).await?;
     sqlx::query(
-        "INSERT INTO rss_full_content_sources (source_id, activation_generation, activation_state)
-         VALUES ($1, 1, 'active')",
+        "INSERT INTO rss_full_content_sources
+            (source_id, activation_generation, activation_state, activation_at)
+         VALUES ($1, 1, 'active', now())",
     )
     .bind(source_id)
     .execute(&pool)

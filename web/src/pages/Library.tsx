@@ -914,15 +914,26 @@ function SourceBar({
                         : S.library.rssModeFeedShort}
                     </span>
                     {rssMode === "full_new_items" && (
-                      <span className="text-neutral-500 shrink-0 u-num">
-                        {S.library.rssHydrationCounts(
-                          source.rss_full_content_pending_count,
-                          source.rss_full_content_queued_count,
-                          source.rss_full_content_retrying_count,
-                          source.rss_full_content_complete_count,
-                          source.rss_full_content_terminal_count,
-                        )}
-                      </span>
+                      <>
+                        <span className="text-neutral-500 shrink-0 u-num">
+                          {S.library.rssHydrationCounts(
+                            source.rss_full_content_pending_count,
+                            source.rss_full_content_queued_count,
+                            source.rss_full_content_retrying_count,
+                            source.rss_full_content_complete_count,
+                            source.rss_full_content_terminal_count,
+                          )}
+                        </span>
+                        <a
+                          className="text-sky-400 hover:text-sky-300 shrink-0"
+                          href={`/api/v1/kbs/${kbId}/sources/${source.id}/rss-full-content/entries`}
+                          target="_blank"
+                          rel="noreferrer"
+                          title={S.library.rssDiagnostics}
+                        >
+                          {S.library.rssDiagnostics}
+                        </a>
+                      </>
                     )}
                   </>
                 )}

@@ -287,17 +287,17 @@ pub async fn discover(
                     embedded_html = $7, doc_time = $8,
                     state = CASE
                         WHEN state = 'terminal'
-                         AND error_code = 'no_usable_content_source'
+                         AND error_code IN ('no_usable_content_source', 'document_deleted')
                          AND $9 THEN 'pending'
                         ELSE state END,
                     error_code = CASE
                         WHEN state = 'terminal'
-                         AND error_code = 'no_usable_content_source'
+                         AND error_code IN ('no_usable_content_source', 'document_deleted')
                          AND $9 THEN NULL
                         ELSE error_code END,
                     error_detail = CASE
                         WHEN state = 'terminal'
-                         AND error_code = 'no_usable_content_source'
+                         AND error_code IN ('no_usable_content_source', 'document_deleted')
                          AND $9 THEN NULL
                         ELSE error_detail END,
                     updated_at = now()
@@ -439,95 +439,309 @@ pub async fn get_entry(pool: &PgPool, entry_id: Uuid) -> AppResult<Option<Entry>
     .await?)
 }
 
-/// Mark the start of one handler attempt. Replayed jobs can safely claim a row
-/// left in `hydrating` if the process died before writing the result.
-pub async fn mark_hydrating(pool: &PgPool, entry_id: Uuid) -> AppResult<Option<i32>> {
+/// Mark the start of one handler attempt. The queue job ID is the durable
+/// claim fence: a replay or stale worker cannot take over a newer claim.
+pub async fn mark_hydrating(
+    pool: &PgPool,
+    entry_id: Uuid,
+    hydration_job_id: i64,
+) -> AppResult<Option<i32>> {
     let row: Option<(i32,)> = sqlx::query_as(
-        "UPDATE rss_full_content_entries
+        "UPDATE rss_full_content_entries AS e
             SET state = 'hydrating', attempt_count = attempt_count + 1,
                 updated_at = now()
-          WHERE id = $1 AND state IN ('queued', 'retry_wait', 'hydrating')
-          RETURNING attempt_count",
+          WHERE e.id = $1
+            AND e.hydration_job_id = $2
+            AND e.state IN ('queued', 'retry_wait', 'hydrating')
+            AND EXISTS (
+                SELECT 1 FROM rss_full_content_sources s
+                 WHERE s.source_id = e.source_id
+                   AND s.activation_generation = e.activation_generation
+                   AND s.activation_state = 'active'
+            )
+          RETURNING e.attempt_count",
     )
     .bind(entry_id)
+    .bind(hydration_job_id)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(attempt_count,)| attempt_count))
 }
 
-pub async fn mark_complete(
+/// Retire a queued/in-flight claim after its source generation is no longer
+/// current. The job ID fence makes this a no-op for a superseded worker.
+pub async fn retire_stale_claim(
     pool: &PgPool,
     entry_id: Uuid,
+    hydration_job_id: i64,
+    source_id: Uuid,
+    generation: i32,
+) -> AppResult<bool> {
+    let result = sqlx::query(
+        "UPDATE rss_full_content_entries AS e
+            SET state = 'terminal', error_code = 'stale_activation',
+                error_detail = 'RSS full-content activation is no longer current',
+                completed_at = NULL, updated_at = now()
+          WHERE e.id = $1
+            AND e.source_id = $3
+            AND e.activation_generation = $4
+            AND e.hydration_job_id = $2
+            AND e.state IN ('queued', 'retry_wait', 'hydrating')
+            AND NOT EXISTS (
+                SELECT 1 FROM rss_full_content_sources s
+                 WHERE s.source_id = e.source_id
+                   AND s.activation_generation = e.activation_generation
+                   AND s.activation_state = 'active'
+            )",
+    )
+    .bind(entry_id)
+    .bind(hydration_job_id)
+    .bind(source_id)
+    .bind(generation)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Commit a fetched artifact and its document projection only while the
+/// activation and job claim are still current. Document creation/version/job
+/// insertion and ledger completion share one transaction, so a stale worker
+/// cannot publish a document before discovering that its claim was revoked.
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_hydration(
+    pool: &PgPool,
+    entry_id: Uuid,
+    hydration_job_id: i64,
+    source_id: Uuid,
+    generation: i32,
+    kb_id: Uuid,
+    external_key: &str,
+    filename: &str,
+    mime: &str,
+    size_bytes: i64,
+    content_sha256: &str,
+    doc_time: Option<DateTime<Utc>>,
     content_source: &str,
     final_url: Option<&str>,
-    content_sha256: &str,
-    document_id: Uuid,
-) -> AppResult<()> {
+) -> AppResult<Option<Uuid>> {
+    let mut tx = pool.begin().await?;
+    let activation: Option<(String, i32)> = sqlx::query_as(
+        "SELECT activation_state, activation_generation
+           FROM rss_full_content_sources
+          WHERE source_id = $1
+          FOR UPDATE",
+    )
+    .bind(source_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if activation != Some(("active".to_string(), generation)) {
+        let _ = retire_stale_claim_tx(&mut tx, entry_id, hydration_job_id, source_id, generation)
+            .await?;
+        tx.commit().await?;
+        return Ok(None);
+    }
+
+    let claim: Option<(Uuid, i32, String, Option<i64>)> = sqlx::query_as(
+        "SELECT source_id, activation_generation, state, hydration_job_id
+           FROM rss_full_content_entries
+          WHERE id = $1
+          FOR UPDATE",
+    )
+    .bind(entry_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let current = claim.is_some_and(|(actual_source, actual_generation, state, job_id)| {
+        actual_source == source_id
+            && actual_generation == generation
+            && state == "hydrating"
+            && job_id == Some(hydration_job_id)
+    });
+    if !current {
+        tx.commit().await?;
+        return Ok(None);
+    }
+
+    let document = crate::documents::upsert_source_document_tx(
+        &mut tx,
+        kb_id,
+        source_id,
+        external_key,
+        filename,
+        mime,
+        size_bytes,
+        content_sha256,
+        doc_time,
+    )
+    .await?;
     let result = sqlx::query(
         "UPDATE rss_full_content_entries
             SET state = 'complete', content_source = $2, final_url = $3,
                 content_sha256 = $4, document_id = $5, error_code = NULL,
                 error_detail = NULL, completed_at = now(), updated_at = now()
-          WHERE id = $1 AND state = 'hydrating'",
+          WHERE id = $1 AND source_id = $6 AND activation_generation = $7
+            AND state = 'hydrating' AND hydration_job_id = $8",
     )
     .bind(entry_id)
     .bind(content_source)
     .bind(final_url)
     .bind(content_sha256)
-    .bind(document_id)
-    .execute(pool)
+    .bind(document.id)
+    .bind(source_id)
+    .bind(generation)
+    .bind(hydration_job_id)
+    .execute(&mut *tx)
     .await?;
-    if result.rows_affected() == 0 {
-        return Err(AppError::Conflict(
-            "RSS full-content entry is no longer hydrating".into(),
-        ));
+    if result.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(None);
     }
-    Ok(())
+    tx.commit().await?;
+    Ok(Some(document.id))
+}
+
+async fn retire_stale_claim_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    entry_id: Uuid,
+    hydration_job_id: i64,
+    source_id: Uuid,
+    generation: i32,
+) -> AppResult<bool> {
+    let result = sqlx::query(
+        "UPDATE rss_full_content_entries AS e
+            SET state = 'terminal', error_code = 'stale_activation',
+                error_detail = 'RSS full-content activation is no longer current',
+                completed_at = NULL, updated_at = now()
+          WHERE e.id = $1
+            AND e.source_id = $3
+            AND e.activation_generation = $4
+            AND e.hydration_job_id = $2
+            AND e.state IN ('queued', 'retry_wait', 'hydrating')",
+    )
+    .bind(entry_id)
+    .bind(hydration_job_id)
+    .bind(source_id)
+    .bind(generation)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 pub async fn mark_retry_wait(
     pool: &PgPool,
     entry_id: Uuid,
+    hydration_job_id: i64,
     error_code: &str,
     error_detail: &str,
-) -> AppResult<()> {
-    set_failure(pool, entry_id, "retry_wait", error_code, error_detail).await
+) -> AppResult<bool> {
+    set_failure(
+        pool,
+        entry_id,
+        hydration_job_id,
+        "retry_wait",
+        error_code,
+        error_detail,
+    )
+    .await
 }
 
 pub async fn mark_terminal(
     pool: &PgPool,
     entry_id: Uuid,
+    hydration_job_id: i64,
     error_code: &str,
     error_detail: &str,
-) -> AppResult<()> {
-    set_failure(pool, entry_id, "terminal", error_code, error_detail).await
+) -> AppResult<bool> {
+    set_failure(
+        pool,
+        entry_id,
+        hydration_job_id,
+        "terminal",
+        error_code,
+        error_detail,
+    )
+    .await
 }
 
 async fn set_failure(
     pool: &PgPool,
     entry_id: Uuid,
+    hydration_job_id: i64,
     state: &str,
     error_code: &str,
     error_detail: &str,
-) -> AppResult<()> {
+) -> AppResult<bool> {
     let result = sqlx::query(
-        "UPDATE rss_full_content_entries
+        "UPDATE rss_full_content_entries AS e
             SET state = $2, error_code = $3, error_detail = $4,
                 updated_at = now()
-          WHERE id = $1 AND state IN ('queued', 'retry_wait', 'hydrating')",
+          WHERE e.id = $1 AND e.hydration_job_id = $5
+            AND e.state IN ('queued', 'retry_wait', 'hydrating')
+            AND EXISTS (
+                SELECT 1 FROM rss_full_content_sources s
+                 WHERE s.source_id = e.source_id
+                   AND s.activation_generation = e.activation_generation
+                   AND s.activation_state = 'active'
+            )",
     )
     .bind(entry_id)
     .bind(state)
     .bind(bound(error_code, 64))
     .bind(bound(error_detail, 2048))
+    .bind(hydration_job_id)
     .execute(pool)
     .await?;
-    if result.rows_affected() == 0 {
-        return Err(AppError::Conflict(
-            "RSS full-content entry is no longer eligible for failure update".into(),
-        ));
-    }
-    Ok(())
+    Ok(result.rows_affected() == 1)
+}
+
+/// Preserve the discovery ledger when a linked document is deleted. A complete
+/// row cannot keep the `complete` invariant with a NULL document_id, so it is
+/// explicitly downgraded to a visible terminal outcome before the FK action.
+pub(crate) async fn detach_document_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    document_id: Uuid,
+) -> AppResult<u64> {
+    let result = sqlx::query(
+        "UPDATE rss_full_content_entries
+            SET state = 'terminal', document_id = NULL, completed_at = NULL,
+                error_code = 'document_deleted',
+                error_detail = 'accepted document was deleted; hydration can be retried',
+                updated_at = now()
+          WHERE document_id = $1",
+    )
+    .bind(document_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn list_current_entries(
+    pool: &PgPool,
+    source_id: Uuid,
+    limit: i64,
+) -> AppResult<Vec<Entry>> {
+    let limit = limit.clamp(1, 100);
+    Ok(sqlx::query_as::<_, Entry>(
+        r#"
+        SELECT id, source_id, activation_generation, external_key, title,
+               article_url, summary, embedded_html, doc_time, state,
+               hydration_job_id, attempt_count, content_source, final_url,
+               content_sha256, document_id, error_code, error_detail,
+               first_seen_at, updated_at, completed_at
+        FROM rss_full_content_entries
+        WHERE source_id = $1
+          AND activation_generation = (
+              SELECT activation_generation
+              FROM rss_full_content_sources
+              WHERE source_id = $1
+          )
+        ORDER BY updated_at DESC, id DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(source_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
 }
 
 pub async fn counts(pool: &PgPool, source_id: Uuid) -> AppResult<Option<Counts>> {

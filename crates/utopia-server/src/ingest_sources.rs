@@ -144,10 +144,9 @@ pub enum IngestAction {
 #[derive(Debug, Clone, Copy)]
 pub struct IngestOutcome {
     pub action: IngestAction,
-    pub document_id: Option<Uuid>,
 }
 
-async fn write_blob(state: &AppState, sha256: &str, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) async fn write_blob(state: &AppState, sha256: &str, bytes: &[u8]) -> anyhow::Result<()> {
     state.blob.put(sha256, bytes).await
 }
 
@@ -241,7 +240,6 @@ pub async fn ingest_item_with_outcome(
     if bytes.is_empty() {
         return Ok(IngestOutcome {
             action: IngestAction::Unchanged,
-            document_id: None,
         });
     }
     let sha256 = sha_hex(bytes);
@@ -272,7 +270,6 @@ pub async fn ingest_item_with_outcome(
         if doc.sha256 == sha256 {
             return Ok(IngestOutcome {
                 action: IngestAction::Unchanged,
-                document_id: Some(doc.id),
             });
         }
         // 变更：原地替换，旧版本入 document_versions，并与处理任务一起提交
@@ -290,7 +287,6 @@ pub async fn ingest_item_with_outcome(
         state.emit_document(kb_id, doc.id);
         return Ok(IngestOutcome {
             action: IngestAction::Updated,
-            document_id: Some(doc.id),
         });
     }
 
@@ -303,12 +299,11 @@ pub async fn ingest_item_with_outcome(
         state.emit_document(kb_id, doc.id);
         return Ok(IngestOutcome {
             action: IngestAction::Moved,
-            document_id: Some(doc.id),
         });
     }
 
     write_blob(state, &sha256, bytes).await?;
-    match utopia_store::documents::create(
+    match utopia_store::documents::create_with_version_and_processing(
         &state.pool,
         kb_id,
         filename,
@@ -322,35 +317,15 @@ pub async fn ingest_item_with_outcome(
     .await
     {
         Ok(doc) => {
-            utopia_store::documents::record_version(
-                &state.pool,
-                doc.id,
-                &sha256,
-                bytes.len() as i64,
-            )
-            .await?;
-            utopia_store::jobs::enqueue(
-                &state.pool,
-                "process_document",
-                serde_json::json!({ "document_id": doc.id }),
-            )
-            .await?;
             state.emit_document(kb_id, doc.id);
             Ok(IngestOutcome {
                 action: IngestAction::Created,
-                document_id: Some(doc.id),
             })
         }
-        // KB 内已有同内容（如手动上传过同一文件）：返回真正的文档 ID，不伪造身份
-        Err(utopia_core::AppError::Conflict(_)) => {
-            let document_id = utopia_store::documents::find_by_kb_sha(&state.pool, kb_id, &sha256)
-                .await?
-                .map(|doc| doc.id);
-            Ok(IngestOutcome {
-                action: IngestAction::Unchanged,
-                document_id,
-            })
-        }
+        // KB 内已有同内容：不伪造新的身份，保留幂等结果
+        Err(utopia_core::AppError::Conflict(_)) => Ok(IngestOutcome {
+            action: IngestAction::Unchanged,
+        }),
         Err(e) => Err(e.into()),
     }
 }
@@ -530,21 +505,36 @@ fn rss_article_link(entry: &feed_rs::model::Entry) -> Option<String> {
     })
 }
 
+const RSS_EXTERNAL_KEY_MAX_BYTES: usize = 4_096;
+
 fn rss_entry_key(entry: &feed_rs::model::Entry, article_url: Option<&str>) -> Option<String> {
-    if !entry.id.trim().is_empty() {
-        return Some(entry.id.trim().to_string());
+    let identity = if !entry.id.trim().is_empty() {
+        entry.id.trim()
+    } else {
+        article_url?.trim()
+    };
+    if identity.is_empty() {
+        return None;
     }
-    article_url.map(str::to_owned)
+    Some(bound_rss_identity(identity))
+}
+
+fn bound_rss_identity(identity: &str) -> String {
+    if identity.len() <= RSS_EXTERNAL_KEY_MAX_BYTES {
+        return identity.to_owned();
+    }
+    // Never truncate a publisher's GUID or URL: doing so silently merges
+    // distinct feed items sharing the same prefix. A bounded digest retains
+    // the complete identity material without violating the database bound.
+    format!("rss:v1:sha256:{}", sha_hex(identity.as_bytes()))
 }
 
 fn content_is_substantive(markdown: &str, summary: &str, linked_page: bool) -> bool {
     crate::rss_full_content::quality_check(markdown, summary, linked_page).is_ok()
 }
 
-fn has_usable_rss_content(feed_usable: bool, article_url: Option<&str>, summary: &str) -> bool {
-    feed_usable
-        || article_url.is_some_and(|url| !url.trim().is_empty())
-        || !summary.trim().is_empty()
+fn has_usable_rss_content(feed_usable: bool, article_url: Option<&str>) -> bool {
+    feed_usable || article_url.is_some_and(|url| !url.trim().is_empty())
 }
 
 async fn sync_rss(state: &AppState, source: &Source) -> anyhow::Result<SyncStats> {
@@ -563,13 +553,18 @@ async fn sync_rss(state: &AppState, source: &Source) -> anyhow::Result<SyncStats
         anyhow::bail!("HTTP {} fetching feed", resp.status());
     }
     let bytes = read_bounded_response(resp, MAX_FEED_BYTES).await?;
-    let feed = feed_rs::parser::parse(&bytes[..])
+    // feed-rs normally synthesizes missing entry IDs from link + title (or a
+    // random UUID). Neither is an application-level stable identity. Leave
+    // missing IDs empty so rss_entry_key can use only the stable article URL.
+    let feed = feed_rs::parser::Builder::new()
+        .id_generator(|_, _, _| String::new())
+        .build()
+        .parse(&bytes[..])
         .map_err(|e| anyhow::anyhow!("Failed to parse feed: {e}"))?;
 
     let observations: Vec<RssObservation> = feed
         .entries
         .iter()
-        .take(MAX_NEW_PER_SYNC)
         .filter_map(|entry| {
             let title = entry
                 .title
@@ -597,8 +592,7 @@ async fn sync_rss(state: &AppState, source: &Source) -> anyhow::Result<SyncStats
             let feed_usable = embedded_markdown
                 .as_deref()
                 .is_some_and(|markdown| content_is_substantive(markdown, &summary, false));
-            let usable_source =
-                has_usable_rss_content(feed_usable, article_url.as_deref(), &summary);
+            let usable_source = has_usable_rss_content(feed_usable, article_url.as_deref());
             Some(RssObservation {
                 key,
                 title,
@@ -618,7 +612,7 @@ async fn sync_rss(state: &AppState, source: &Source) -> anyhow::Result<SyncStats
         let entries: Vec<utopia_store::rss_full_content::NewEntry> = observations
             .iter()
             .map(|observation| utopia_store::rss_full_content::NewEntry {
-                external_key: truncate_utf8(&observation.key, 4_096),
+                external_key: observation.key.clone(),
                 title: truncate_utf8(&observation.title, 2_048),
                 article_url: observation
                     .article_url
@@ -672,7 +666,7 @@ async fn sync_rss(state: &AppState, source: &Source) -> anyhow::Result<SyncStats
     }
 
     let mut stats = SyncStats::default();
-    for observation in observations {
+    for observation in observations.into_iter().take(MAX_NEW_PER_SYNC) {
         let RssObservation {
             key,
             title,
@@ -1163,17 +1157,39 @@ fn ensure_extension(title: &str, mime: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::has_usable_rss_content;
+    use super::{
+        bound_rss_identity, has_usable_rss_content, rss_entry_key, RSS_EXTERNAL_KEY_MAX_BYTES,
+    };
 
     #[test]
-    fn summary_makes_an_rss_entry_hydratable_without_an_article_link() {
-        assert!(has_usable_rss_content(false, None, "A useful summary."));
-        assert!(has_usable_rss_content(
-            false,
-            Some("https://example.com/a"),
-            ""
-        ));
-        assert!(has_usable_rss_content(true, None, ""));
-        assert!(!has_usable_rss_content(false, None, "   "));
+    fn summary_only_does_not_make_an_rss_entry_hydratable_without_an_article_link() {
+        assert!(!has_usable_rss_content(false, None));
+        assert!(has_usable_rss_content(false, Some("https://example.com/a")));
+        assert!(has_usable_rss_content(true, None));
+    }
+
+    #[test]
+    fn overlong_rss_identity_is_hashed_without_prefix_collisions_from_truncation() {
+        let first = "a".repeat(RSS_EXTERNAL_KEY_MAX_BYTES) + "-one";
+        let second = "a".repeat(RSS_EXTERNAL_KEY_MAX_BYTES) + "-two";
+        let first = bound_rss_identity(&first);
+        let second = bound_rss_identity(&second);
+        assert_ne!(first, second);
+        assert!(first.len() < RSS_EXTERNAL_KEY_MAX_BYTES);
+    }
+
+    #[test]
+    fn parser_leaves_missing_entry_ids_empty_for_application_fallback() {
+        let feed = feed_rs::parser::Builder::new()
+            .id_generator(|_, _, _| String::new())
+            .build()
+            .parse(
+                &br#"<?xml version="1.0"?><rss version="2.0"><channel><title>Test</title><link>https://example.com/</link><description>Test</description><item><title>Original</title><description>Summary</description></item></channel></rss>"#[..],
+            )
+            .expect("test feed should parse");
+        let entry = &feed.entries[0];
+        assert!(entry.id.is_empty());
+        assert!(rss_entry_key(entry, None).is_none());
+        assert!(rss_entry_key(entry, Some("https://example.com/article")).is_some());
     }
 }

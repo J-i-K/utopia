@@ -152,6 +152,7 @@ struct AcceptedContent {
 /// feed still exposing the item.
 pub(crate) async fn hydrate_entry(
     state: &crate::state::AppState,
+    hydration_job_id: i64,
     source_id: uuid::Uuid,
     entry_id: uuid::Uuid,
 ) -> anyhow::Result<()> {
@@ -162,10 +163,12 @@ pub(crate) async fn hydrate_entry(
         let _ = utopia_store::rss_full_content::mark_terminal(
             &state.pool,
             entry_id,
+            hydration_job_id,
             "source_mismatch",
             "hydration job source does not match ledger source",
         )
         .await;
+        state.emit_source(source_id);
         return Ok(());
     }
     if matches!(entry.state.as_str(), "complete" | "terminal") {
@@ -181,69 +184,99 @@ pub(crate) async fn hydrate_entry(
         || activation.activation_state != "active"
         || activation.activation_generation != entry.activation_generation
     {
-        utopia_store::rss_full_content::mark_terminal(
+        utopia_store::rss_full_content::retire_stale_claim(
             &state.pool,
             entry_id,
-            if full_mode {
-                "stale_activation"
-            } else {
-                "source_disabled"
-            },
-            "RSS full-content activation is no longer current",
+            hydration_job_id,
+            source_id,
+            entry.activation_generation,
         )
         .await?;
+        state.emit_source(source.kb_id);
         return Ok(());
     }
 
     let Some(attempt) =
-        utopia_store::rss_full_content::mark_hydrating(&state.pool, entry_id).await?
+        utopia_store::rss_full_content::mark_hydrating(&state.pool, entry_id, hydration_job_id)
+            .await?
     else {
+        // The claim may have been superseded between the read above and the
+        // state transition. Retiring only the matching job keeps a newer claim
+        // untouched.
+        utopia_store::rss_full_content::retire_stale_claim(
+            &state.pool,
+            entry_id,
+            hydration_job_id,
+            source_id,
+            entry.activation_generation,
+        )
+        .await?;
+        state.emit_source(source.kb_id);
         return Ok(());
     };
+    let _ = attempt;
+    state.emit_source(source.kb_id);
 
     let result = hydrate_content(&entry).await;
     let accepted = match result {
         Ok(content) => content,
         Err(error) => {
-            return handle_hydration_failure(&state.pool, entry_id, attempt, error.into()).await;
+            let result = handle_hydration_failure(
+                &state.pool,
+                entry_id,
+                hydration_job_id,
+                attempt,
+                error.into(),
+            )
+            .await;
+            state.emit_source(source.kb_id);
+            return result;
         }
     };
     let digest = sha256_hex(accepted.markdown.as_bytes());
-    let outcome = match crate::ingest_sources::ingest_item_with_outcome(
-        state,
-        source.kb_id,
+    if let Err(error) =
+        crate::ingest_sources::write_blob(state, &digest, accepted.markdown.as_bytes()).await
+    {
+        let result =
+            handle_hydration_failure(&state.pool, entry_id, hydration_job_id, attempt, error).await;
+        state.emit_source(source.kb_id);
+        return result;
+    }
+    let completed = match utopia_store::rss_full_content::complete_hydration(
+        &state.pool,
+        entry_id,
+        hydration_job_id,
         source.id,
+        entry.activation_generation,
+        source.kb_id,
         &entry.external_key,
         &format!("{}.md", hydration_filename(&entry.title)),
         "text/markdown",
-        accepted.markdown.as_bytes(),
+        accepted.markdown.len() as i64,
+        &digest,
         entry.doc_time,
+        accepted.source,
+        accepted.final_url.as_deref(),
     )
     .await
     {
-        Ok(outcome) => outcome,
+        Ok(completed) => completed,
         Err(error) => {
-            return handle_hydration_failure(&state.pool, entry_id, attempt, error).await;
+            let result = handle_hydration_failure(
+                &state.pool,
+                entry_id,
+                hydration_job_id,
+                attempt,
+                error.into(),
+            )
+            .await;
+            state.emit_source(source.kb_id);
+            return result;
         }
     };
-    let Some(document_id) = outcome.document_id else {
-        return handle_hydration_failure(
-            &state.pool,
-            entry_id,
-            attempt,
-            anyhow::anyhow!("hydration ingestion returned no document id"),
-        )
-        .await;
-    };
-    utopia_store::rss_full_content::mark_complete(
-        &state.pool,
-        entry_id,
-        accepted.source,
-        accepted.final_url.as_deref(),
-        &digest,
-        document_id,
-    )
-    .await?;
+    if let Some(document_id) = completed {
+        state.emit_document(source.kb_id, document_id);
+    }
     state.emit_source(source.kb_id);
     Ok(())
 }
@@ -260,27 +293,24 @@ async fn hydrate_content(
     }
 
     let Some(article_url) = entry.article_url.as_deref() else {
-        return summary_fallback(&entry.summary);
+        return Err(ContentError::NoUsableSource);
     };
-    let page = match fetch_article(article_url).await {
-        Ok(page) => page,
-        Err(error) => return summary_fallback_or_error(&entry.summary, error),
-    };
+    let page = fetch_article(article_url).await?;
     let markdown = if page.content_type == "text/markdown" {
-        match normalize_markdown(&page.body) {
-            Ok(markdown) => markdown,
-            Err(error) => return summary_fallback_or_error(&entry.summary, error),
-        }
+        normalize_markdown(&page.body)?
     } else {
         match extract_article_markdown(&page.body, page.final_url.as_str()) {
             Ok(markdown) => markdown,
-            Err(error) => return summary_fallback_or_error(&entry.summary, error),
+            Err(ContentError::Extraction(_) | ContentError::Conversion(_)) => {
+                // Readability is preferred, but a bounded raw page can still be
+                // a valid article. Reuse the same converter and linked-page
+                // quality gate rather than silently losing usable content.
+                markdown_from_html(&page.body)?
+            }
+            Err(error) => return Err(error),
         }
     };
-    match accept_linked_markdown(markdown, &entry.summary, Some(page.final_url.to_string())) {
-        Ok(content) => Ok(content),
-        Err(error) => summary_fallback_or_error(&entry.summary, error),
-    }
+    accept_linked_markdown(markdown, &entry.summary, Some(page.final_url.to_string()))
 }
 
 fn canonical_content(
@@ -301,24 +331,6 @@ fn canonical_content(
     })
 }
 
-fn summary_fallback(summary: &str) -> Result<AcceptedContent, ContentError> {
-    if summary.trim().is_empty() {
-        return Err(ContentError::NoUsableSource);
-    }
-    let markdown = normalize_feed_html(summary)?;
-    canonical_content(markdown, "feed", None)
-}
-
-fn summary_fallback_or_error(
-    summary: &str,
-    error: ContentError,
-) -> Result<AcceptedContent, ContentError> {
-    match summary_fallback(summary) {
-        Ok(content) => Ok(content),
-        Err(_) => Err(error),
-    }
-}
-
 fn accept_linked_markdown(
     markdown: String,
     summary: &str,
@@ -331,6 +343,7 @@ fn accept_linked_markdown(
 async fn handle_hydration_failure(
     pool: &sqlx::PgPool,
     entry_id: uuid::Uuid,
+    hydration_job_id: i64,
     attempt: i32,
     error: anyhow::Error,
 ) -> anyhow::Result<()> {
@@ -344,11 +357,33 @@ async fn handle_hydration_failure(
     } else {
         "full-content acquisition will be retried"
     };
+    let transitioned = if terminal {
+        utopia_store::rss_full_content::mark_terminal(
+            pool,
+            entry_id,
+            hydration_job_id,
+            code,
+            detail,
+        )
+        .await?
+    } else {
+        utopia_store::rss_full_content::mark_retry_wait(
+            pool,
+            entry_id,
+            hydration_job_id,
+            code,
+            detail,
+        )
+        .await?
+    };
+    if !transitioned {
+        // The source generation or claim was superseded. Do not turn a stale
+        // worker into a retry of a newer job.
+        return Ok(());
+    }
     if terminal {
-        utopia_store::rss_full_content::mark_terminal(pool, entry_id, code, detail).await?;
         return Err(anyhow::Error::new(utopia_core::Terminal).context(code));
     }
-    utopia_store::rss_full_content::mark_retry_wait(pool, entry_id, code, detail).await?;
     Err(anyhow::anyhow!(code))
 }
 
@@ -591,6 +626,9 @@ pub(crate) fn extract_article_html(html: &str, url: &str) -> Result<String, Cont
 
 pub(crate) fn extract_article_markdown(html: &str, url: &str) -> Result<String, ContentError> {
     let article_html = extract_article_html(html, url)?;
+    if looks_like_challenge_html(&article_html) {
+        return Err(ContentError::ChallengePage);
+    }
     markdown_from_html(&article_html)
 }
 
@@ -621,13 +659,70 @@ fn looks_like_challenge_shell(lowered: &str) -> bool {
         "enter the captcha",
         "captcha verification",
     ];
-    HIGH_CONFIDENCE_MARKERS
+    if HIGH_CONFIDENCE_MARKERS
         .iter()
         .any(|marker| lowered.contains(marker))
         || lowered
             .lines()
             .take(3)
             .any(|line| line.trim().trim_start_matches('#').trim() == "access denied")
+    {
+        return true;
+    }
+
+    // Readability can retain a long login/consent shell without any of the
+    // exact phrases above. Require two short, control-like lines so ordinary
+    // articles that mention one of these topics are not rejected.
+    const STRUCTURAL_MARKERS: &[&str] = &[
+        "sign in",
+        "log in",
+        "login",
+        "create account",
+        "register",
+        "cookie settings",
+        "consent preferences",
+        "accept all cookies",
+        "enable javascript",
+        "access denied",
+        "play video",
+        "watch now",
+    ];
+    let structural_hits = lowered
+        .lines()
+        .take(40)
+        .filter(|line| {
+            let line = line.trim().trim_start_matches('#').trim();
+            line.len() <= 96
+                && STRUCTURAL_MARKERS
+                    .iter()
+                    .any(|marker| line.contains(marker))
+        })
+        .count();
+    let has_auth_fields = (lowered.contains("password")
+        && (lowered.contains("email") || lowered.contains("username")))
+        || lowered.contains("<form");
+    structural_hits >= 2 || (structural_hits >= 1 && has_auth_fields)
+}
+
+fn looks_like_challenge_html(html: &str) -> bool {
+    let lowered = html.to_ascii_lowercase();
+    let auth_form = lowered.contains("<form")
+        && (lowered.contains("password")
+            || lowered.contains("type=\"email\"")
+            || lowered.contains("type='email'"));
+    let player_shell = [
+        "jwplayer",
+        "brightcove",
+        "data-player",
+        "<video",
+        "youtube.com/embed",
+        "player.vimeo.com",
+    ]
+    .iter()
+    .filter(|marker| lowered.contains(**marker))
+    .count()
+        >= 2;
+    auth_form || player_shell
 }
 
 pub(crate) fn quality_check(
@@ -730,7 +825,7 @@ fn is_public_ip(ip: IpAddr) -> bool {
                 || (a == 100 && (64..=127).contains(&b))
                 || (a == 169 && b == 254)
                 || (a == 172 && (16..=31).contains(&b))
-                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 0)
                 || (a == 192 && b == 0 && c == 2)
                 || (a == 192 && b == 88 && c == 99)
                 || (a == 192 && b == 168)
@@ -746,6 +841,7 @@ fn is_public_ip(ip: IpAddr) -> bool {
             let is_v4_mapped = segments[..5] == [0, 0, 0, 0, 0] && segments[5] == 0xffff;
             let mapped_v4 = u32::from(segments[6]) << 16 | u32::from(segments[7]);
             let is_nat64 = segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0];
+            let is_private_nat64 = segments[..3] == [0x0064, 0xff9b, 1];
             let is_6to4 = first == 0x2002;
             let embedded_v4 = if is_v4_mapped || is_nat64 {
                 Some(mapped_v4)
@@ -759,6 +855,7 @@ fn is_public_ip(ip: IpAddr) -> bool {
                 || (first & 0xff00) == 0xff00
                 || (first & 0xfe00) == 0xfc00
                 || (first & 0xffc0) == 0xfe80
+                || is_private_nat64
                 || (first == 0x2001 && segments[1] == 0x0db8)
                 || (first == 0x2001 && segments[1] == 0x0000)
                 || (first == 0x2001 && (segments[1] & 0xfff0) == 0x0010)
@@ -872,7 +969,9 @@ fn is_unsafe_markdown_destination(destination: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use std::net::SocketAddr;
+    use uuid::Uuid;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1118,13 +1217,57 @@ mod tests {
         assert!(matches!(result, Err(ContentError::TooLarge)));
     }
 
+    #[tokio::test]
+    async fn summary_only_entries_are_not_marked_as_full_content() {
+        let now = Utc::now();
+        let entry = utopia_store::rss_full_content::Entry {
+            id: Uuid::nil(),
+            source_id: Uuid::nil(),
+            activation_generation: 1,
+            external_key: "summary-only".into(),
+            title: "Summary only".into(),
+            article_url: None,
+            summary: "A short but useful RSS summary.".into(),
+            embedded_html: None,
+            doc_time: None,
+            state: "hydrating".into(),
+            hydration_job_id: None,
+            attempt_count: 1,
+            content_source: None,
+            final_url: None,
+            content_sha256: None,
+            document_id: None,
+            error_code: None,
+            error_detail: None,
+            first_seen_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        assert!(matches!(
+            hydrate_content(&entry).await,
+            Err(ContentError::NoUsableSource)
+        ));
+    }
+
     #[test]
-    fn summary_fallback_keeps_an_ingestible_item_when_full_content_is_unavailable() {
-        let accepted = summary_fallback("A short but useful RSS summary.")
-            .expect("non-empty summaries must remain available as fallback");
-        assert_eq!(accepted.source, "feed");
-        assert_eq!(accepted.final_url, None);
-        assert_eq!(accepted.markdown, "A short but useful RSS summary.");
+    fn generic_login_shells_fail_the_quality_gate() {
+        let body = (0..210)
+            .map(|index| format!("shell{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let shell = format!("# Login\nEmail\nPassword\n{body}");
+        assert!(matches!(
+            quality_check(&shell, "", true),
+            Err(ContentError::ChallengePage)
+        ));
+    }
+
+    #[test]
+    fn private_nat64_prefix_is_blocked() {
+        assert!(matches!(
+            validate_article_url("http://[64:ff9b:1::1]/article"),
+            Err(ContentError::BlockedAddress)
+        ));
     }
 
     #[test]

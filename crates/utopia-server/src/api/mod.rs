@@ -323,6 +323,10 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
             get(sources_routes::runs),
         )
         .route(
+            "/kbs/{id}/sources/{source_id}/rss-full-content/entries",
+            get(sources_routes::full_content_entries),
+        )
+        .route(
             "/kbs/{id}/sources/{source_id}/re-extract",
             post(sources_routes::re_extract),
         )

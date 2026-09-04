@@ -208,6 +208,14 @@ pub async fn set_ingest_token(pool: &PgPool, source_id: Uuid, token: &str) -> Ap
 }
 
 /// 更新调度：interval 与 cron 互斥，任一被显式设置时都会覆盖两者。
+fn rss_feed_url(config: &serde_json::Value) -> Option<&str> {
+    config
+        .get("feed_url")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn update(
     pool: &PgPool,
@@ -243,6 +251,10 @@ pub async fn update(
         .unwrap_or_else(|| previous.config.clone());
     let old_full = rss_full_content_enabled(&previous.kind, &previous.config)?;
     let new_full = rss_full_content_enabled(&previous.kind, &next_config)?;
+    let feed_url_changed = previous.kind == "rss"
+        && old_full
+        && new_full
+        && rss_feed_url(&previous.config) != rss_feed_url(&next_config);
     let source = sqlx::query_as(
         "UPDATE sources SET
             name = COALESCE($2, name),
@@ -268,7 +280,7 @@ pub async fn update(
     .fetch_one(&mut *tx)
     .await?;
 
-    if !old_full && new_full {
+    if (!old_full && new_full) || feed_url_changed {
         crate::rss_full_content::enable_source(&mut tx, id).await?;
     } else if old_full && !new_full {
         crate::rss_full_content::disable_source(&mut tx, id).await?;

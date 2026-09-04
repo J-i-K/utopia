@@ -215,6 +215,21 @@ export interface SourceView {
   rss_full_content_terminal_count: number;
 }
 
+export interface RssFullContentEntryDiagnostic {
+  id: string;
+  title: string;
+  has_article_url: boolean;
+  document_time: string | null;
+  updated_at: string;
+  state: "pending" | "queued" | "hydrating" | "retry_wait" | "complete" | "terminal";
+  attempt_count: number;
+  error_code: string | null;
+  error_detail: string | null;
+  content_source: "feed" | "web" | null;
+  document_id: string | null;
+  completed_at: string | null;
+}
+
 export interface SearchResult {
   id: string;
   document_id: string;
@@ -1677,6 +1692,10 @@ export const api = {
   sourceRuns: (kbId: string, sourceId: string) =>
     request<{ runs: SyncRun[] }>(
       `/api/v1/kbs/${kbId}/sources/${sourceId}/runs`,
+    ),
+  rssFullContentEntries: (kbId: string, sourceId: string) =>
+    request<{ entries: RssFullContentEntryDiagnostic[] }>(
+      `/api/v1/kbs/${kbId}/sources/${sourceId}/rss-full-content/entries`,
     ),
   documentExtractions: (docId: string) =>
     request<{ facts: ChunkFact[] }>(`/api/v1/documents/${docId}/extractions`),

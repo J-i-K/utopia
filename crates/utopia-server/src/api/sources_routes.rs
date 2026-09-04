@@ -291,6 +291,39 @@ pub async fn delete(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// RSS full-content 当前代的逐条诊断。响应不包含抓取正文，只包含有限的状态和原因，
+/// 供来源故障定位使用。
+pub async fn full_content_entries(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((kb_id, source_id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_kb(&state, &user, kb_id, Role::Viewer).await?;
+    source_in_kb(&state, kb_id, source_id).await?;
+    let entries =
+        utopia_store::rss_full_content::list_current_entries(&state.pool, source_id, 100).await?;
+    let entries = entries
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "id": entry.id,
+                "title": entry.title,
+                "has_article_url": entry.article_url.is_some(),
+                "document_time": entry.doc_time,
+                "updated_at": entry.updated_at,
+                "state": entry.state,
+                "attempt_count": entry.attempt_count,
+                "error_code": entry.error_code,
+                "error_detail": entry.error_detail,
+                "content_source": entry.content_source,
+                "document_id": entry.document_id,
+                "completed_at": entry.completed_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "entries": entries })))
+}
+
 /// 同步运行历史（渠道审计）。
 pub async fn runs(
     State(state): State<AppState>,

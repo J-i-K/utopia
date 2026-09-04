@@ -415,7 +415,7 @@ async fn dispatch(st: &state::AppState, job: &utopia_store::jobs::Job) -> anyhow
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| anyhow::anyhow!("payload 缺少 rss_entry_id"))?;
-            rss_full_content::hydrate_entry(st, source_id, entry_id).await
+            rss_full_content::hydrate_entry(st, job.id, source_id, entry_id).await
         }
         other => anyhow::bail!("未知任务类型: {other}"),
     }
