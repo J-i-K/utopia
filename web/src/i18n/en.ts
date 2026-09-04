@@ -24,7 +24,7 @@ export const en = {
     registration_closed:
       "Sign-up is closed on this deployment — ask an administrator for an account.",
     no_chat_model:
-      "No chat model configured yet. Set one under Settings → Models.",
+      "No chat model configured yet. Set one under Administration → Models.",
     bad_upload: "That upload could not be read.",
     upload_read_failed: "The file could not be read to the end.",
     no_files: "No file was attached.",
@@ -64,7 +64,7 @@ export const en = {
     no_data_sources: "No databases are mounted on this knowledge base.",
     // 授权是逐工作区的（0014）：源没授权给本库所属的工作区
     source_not_granted:
-      "This data source is not granted to this workspace. Ask a deployment admin to grant it in System settings → Data sources.",
+      "This data source is not granted to this workspace. Ask a deployment admin to grant it in Administration → Data sources.",
     memory_source_permanent:
       "The Memory source is part of the knowledge base and stays.",
     source_name_required: "Give this source a name.",
@@ -207,15 +207,15 @@ export const en = {
       },
       "llm.unreachable": {
         title: "The model endpoint gave no usable answer",
-        hint: "Extraction and embedding are stopped. Check the endpoint URL in system settings.",
+        hint: "Extraction and embedding are stopped. Check the endpoint URL in Administration → Models.",
       },
       "llm.rate_limited": {
         title: "The model endpoint is rate limiting us",
-        hint: "Documents were retried and still turned away, so some are missing facts. Lower model concurrency in system settings, or raise the quota on the account.",
+        hint: "Documents were retried and still turned away, so some are missing facts. Lower model concurrency in Administration, or raise the quota on the account.",
       },
       "llm.out_of_credit": {
         title: "The model account cannot pay for requests",
-        hint: "Extraction and embedding are stopped and will not resume on their own. Top up the account, or point system settings at an endpoint that can serve.",
+        hint: "Extraction and embedding are stopped and will not resume on their own. Top up the account, or set an endpoint that can serve in Administration → Models.",
       },
     } as Record<string, { title: string; hint: string } | undefined>,
     // 没见过的 kind 也要能显示：新告警源上线时前端可能还没更新
@@ -311,7 +311,7 @@ export const en = {
         {
           h: "Retention and deletion",
           body: [
-            "Deleting a document removes its stored content and index entries. Facts already extracted into the knowledge graph remain, with their provenance, until removed through Review. Deleting a knowledge base permanently removes its documents, graph and sources.",
+            "Deleting a document removes it from the base and retires the facts that had no other source; facts with another source keep it as provenance. The content is kept so the deletion can be undone; a deleted document can be restored, and a re-upload of the same file restores it too. A knowledge-base admin can purge a deleted document, which removes its stored content for good. Deleting a knowledge base permanently removes its documents, graph and sources.",
           ],
         },
         {
@@ -363,6 +363,28 @@ export const en = {
     },
   },
   library: {
+    /** 删除是墓碑（#268）：说清作废了几条事实，并给撤销 */
+    deletedWithFacts: (n: number) =>
+      n === 0
+        ? "Document deleted"
+        : n === 1
+          ? "Document deleted · 1 fact retired with it"
+          : `Document deleted · ${n} facts retired with it`,
+    undo: "Undo",
+    restored: "Document restored",
+    /** 「已删除」视图与真删（#268 下半） */
+    deleted: "Deleted",
+    colDeleted: "Deleted",
+    restore: "Restore",
+    purge: "Purge",
+    purgeTitle: "Purge this document?",
+    purgeHint: (name: string) =>
+      `“${name}” is deleted, and its content is still stored so the deletion can be undone. ` +
+      "Purging removes the stored file, its chunks and its evidence quotes for good. " +
+      "The facts it retired stay retired, and the deletion stays on record. This cannot be undone.",
+    purgeConfirm: "Purge",
+    purged: "Content purged",
+    deletedEmpty: "Nothing deleted. Deleted documents wait here until they are restored or purged.",
     title: "Library",
     upload: "Upload files",
     uploading: "Uploading…",
@@ -419,6 +441,7 @@ export const en = {
       domain_mismatch:
         "The subject does not fit the relation, and swapping would not help",
       not_an_entity_name: "That name is a sentence, not a thing",
+      clause_suspect: "Kept, but the name reads like a clause: a sample for the guard",
       direction_corrected:
         "Subject and object were swapped to match the signature",
     } as Record<string, string>,
@@ -627,8 +650,8 @@ export const en = {
     cleanupTitle: "Delete missing documents",
     cleanupHint: (n: number, name: string) =>
       `${n} document${n === 1 ? "" : "s"} in “${name}” ${n === 1 ? "is" : "are"} no longer ` +
-      "present in the source. Deleting removes their content and search entries permanently. " +
-      "Facts already extracted into the graph remain, with their provenance.",
+      "present in the source. Deleting removes them from the base and retires the facts that " +
+      "had no other source. Their content is kept, and a deleted document can be restored.",
     cleanupConfirm: "Delete them",
     deleteSourceTitle: "Delete this source",
     deleteSourceBody: (name: string) =>
@@ -648,7 +671,7 @@ export const en = {
     greeting: "Ask Utopia what it remembers",
     emptyTitle: "Chat",
     emptyBody:
-      "Converse with your knowledge base — cited answers, temporal questions, and it can remember.\nUpload documents in Library and configure a model in Settings first.",
+      "Converse with your knowledge base — cited answers, temporal questions, and it can remember.\nUpload documents in Library and configure a model in Administration → Models first.",
     placeholder: "Ask anything…",
     composerHint: "Enter to send · Shift+Enter for a new line",
     scopeLabel: "Knowledge base",
@@ -694,8 +717,13 @@ export const en = {
     backToOverview: "← Full graph",
     // 顺序不是随便排的：模型没配好之前，上传的文档只会排队等着，
     // 一个实体也抽不出来。先配模型，再传文档
+    // 管理页在头像菜单里叫 Administration，提示语得叫同一个名字（#267）。
+    // 能配模型的人和不能配的人看到的不是同一句：后者只能去找管理员
     emptyBody:
-      "The graph is empty. Configure a chat model in Settings first, then upload documents in the Library — entities and relations are extracted automatically.",
+      "The graph is empty. Ask an administrator to configure a chat model, then upload documents in the Library — entities and relations are extracted automatically.",
+    emptyBodyAdmin:
+      "The graph is empty. Configure a chat model under Administration → Models first, then upload documents in the Library — entities and relations are extracted automatically.",
+    emptyOpenModels: "Open Administration → Models",
     facts: "facts",
     noFacts: "No facts for this entity yet",
     confidence: "confidence",
@@ -714,6 +742,10 @@ export const en = {
     sectionRef: (filename: string, seq: number) =>
       `${filename} · section ${seq} →`,
     fromVersion: (v: number) => `v${v}`,
+    /** 证据所在的文档已删（#268）：事实还在是因为另有出处 */
+    sourceDeleted: "source deleted",
+    sourceDeletedHint:
+      "The document this quote came from was deleted. The fact stays because it has another source.",
     staleEvidenceHint:
       "This evidence comes from an earlier version of the document. " +
       "The document has since been updated; the fact itself is unaffected.",
@@ -736,6 +768,7 @@ export const en = {
         : `${n} other entities share this name.`,
     sameNameHint: "If they are the same thing, merge them under Review.",
     mergeInto: "Merge in",
+    mergeTitle: "Merge entities",
     mergeIntoHint:
       "Fold that entity into this one. Its facts move here; merges can be reverted.",
     mergeConfirm: (from: string, into: string) =>
@@ -819,9 +852,33 @@ export const en = {
     undated: "Undated",
     timelineEmpty: "No dated facts yet.",
     lastConfirmed: (d: string) => `confirmed ${d}`,
+    /* 三种来源共用一个标记（引擎接任对账、Review 裁决、有人手改），所以这句
+       不再声称是哪一种——加上人工编辑之后，原来那句「由对账闭合」会说错来源。
+       想知道是谁改的，History 有 actor 和时刻 */
     correctedHint:
-      "This interval was closed by reconciliation (automatic succession or a review decision), " +
-      "not stated verbatim in a document. The superseded assertion remains in the ledger.",
+      "This interval comes from a correction rather than a sentence in a document: " +
+      "automatic succession, a review decision, or someone editing it. " +
+      "The superseded assertion stays in the ledger — see History for who and when.",
+    /* ---- 人工修正有效区间（302） ---- */
+    editTime: "Correct the interval",
+    timeStart: "Start",
+    timeEnd: "End",
+    /* 结束端的三态，与账本里的三种写法一一对应（见迁移 0003 的注释） */
+    timeEndOpen: "Still going",
+    timeEndUnknown: "Ended, date unknown",
+    timeEndDate: "Ended on",
+    /* 写多少位就是多少精度：2023 是「那一年」，2023-06 是「那个月」 */
+    timeFormat: "2023, 2023-06 or 2023-06-15",
+    timeBadDate: "Use 2023, 2023-06 or 2023-06-15.",
+    timeNote: "Why (optional)",
+    timeNotePlaceholder: "The document says the first half of 2023",
+    timeSave: "Save",
+    timeCancel: "Cancel",
+    timeSaved: "Interval corrected",
+    timeSavedClosed: (n: number) =>
+      `Interval corrected — ${n} open fact${n === 1 ? "" : "s"} closed to match`,
+    timeSavedConflicts: (n: number) =>
+      `Interval corrected — ${n} conflict${n === 1 ? "" : "s"} need a ruling in Review`,
     ongoing: "now",
     /* 必须跟 ongoing 看得出区别：混淆这两个正是迁移 0046 要修的东西——
        原文说 "former CEO"，界面却显示 now */
@@ -861,7 +918,7 @@ export const en = {
     ongoing: "now",
   },
   settings: {
-    title: "System settings",
+    title: "Administration",
     tabModels: "Models",
     tabMembers: "Users",
     tabKbs: "Knowledge bases",
@@ -907,9 +964,10 @@ export const en = {
         "Register connections here; each knowledge base mounts the ones it may query.",
       name: "Name",
       connString: "Connection string — the scheme picks the engine",
-      // 四种写法各一行；令牌放 password 位，Databricks 的路径就是控制台里的 httpPath
+      // 每种写法各一行；令牌放 password 位，Databricks 的路径就是控制台里的 httpPath
       connSchemes:
         "postgres://user:pass@host:5432/db\n" +
+        "mysql://user:pass@host:3306/db   (MariaDB, TiDB, OceanBase, Doris, StarRocks)\n" +
         "trino://user[:pass]@host:8080/catalog[/schema]   (Iceberg, Delta Lake, Hive)\n" +
         "databricks://:TOKEN@host/sql/1.0/warehouses/ID?catalog=main\n" +
         "snowflake://:TOKEN@account.snowflakecomputing.com/DB/SCHEMA?warehouse=WH",
@@ -919,6 +977,7 @@ export const en = {
       testFail: "Failed",
       neverTested: "Untested",
       remove: "Remove",
+      empty: "No data sources registered yet. Register one below.",
       grants: "Available to",
       grantsHint:
         "Which workspaces may use this source. **Once granted, KB admins in those workspaces choose whether to mount it** — " +
@@ -951,6 +1010,7 @@ export const en = {
       visRestricted: "Invited only",
       create: "Create",
       openSettings: "Settings",
+      empty: "No knowledge bases yet. Create the first one above.",
       docs: (n: number) => `${n} docs`,
     },
     modelsIntro:
@@ -1006,9 +1066,6 @@ export const en = {
     description: "Description",
     descriptionHint:
       "Guides the extractor: what belongs here, with a couple of examples. Fed straight into the extraction prompt.",
-    overviewHint:
-      "The schema your extractor follows. Select a class or property on the left to edit it, or add new ones with the + buttons.",
-    overviewStats: (c: number, p: number) => `${c} classes · ${p} properties`,
     attributes: "Attributes",
     attributesHint:
       "Literal-valued fields of this class (a person's salary, a contract's amount). Extracted with evidence and history, like any fact.",
@@ -1021,7 +1078,7 @@ export const en = {
       text: "Text",
       number: "Number",
       date: "Date",
-      bool: "Yes / no",
+      bool: "Boolean",
     } as Record<string, string>,
     cancel: "Cancel",
     key: "Key",
@@ -1033,7 +1090,7 @@ export const en = {
     disjoint: "Cannot also be",
     disjointHint:
       "Classes nothing can belong to at the same time. A Person is not an Organisation. The consistency check uses this to find classes that can never have an instance.",
-    noDisjoint: "No class excluded",
+    noDisjoint: "None declared yet",
     disjointWithParent:
       "This class inherits from a class it says it cannot be — nothing could ever satisfy it.",
     /* 多父时左栏只能画一处，说明画在哪一支下 */
@@ -1199,6 +1256,41 @@ export const en = {
       `Some could not be added: ${keys.join(", ")} — the rest went through.`,
     proposals: "AI proposals",
     keyHint: "lowercase_snake_case",
+    /* ---- Schema diagram ---- */
+    schemaDiagram: "Schema diagram",
+    schemaSearchPlaceholder: "Search schema…",
+    schemaEmpty:
+      "No schema to display yet. Add a class on the left, or import an OWL/RDFS/Turtle file to get started.",
+    schemaFitView: "Fit view",
+    schemaZoomIn: "Zoom in",
+    schemaZoomOut: "Zoom out",
+    schemaLegendInheritance: "Inheritance",
+    schemaLegendRelation: "Relations",
+    schemaLegendDisjoint: "Disjoint",
+    schemaUnscoped: (n: number) => `Unscoped properties (${n})`,
+    schemaUnscopedHint:
+      "Not limited to specific classes, so no line on the canvas would be honest. Select one to inspect or edit it.",
+    schemaClosePanel: "Close",
+    // 面板里的三段：定义（表单）/ 属性（关系 + 字面值字段）/ 实例。
+    // 用页面自己的词——左栏就叫 Classes / Properties
+    schemaTabDefinition: "Definition",
+    schemaTabProperties: "Properties",
+    schemaTabInstances: "Instances",
+    schemaAddRelationship: "New relationship…",
+    schemaCheckDefects: (n: number) =>
+      n === 1
+        ? "1 new ontology issue from this change"
+        : `${n} new ontology issues from this change`,
+    schemaCheckReview: "Review",
+    schemaRelationships: "Relationships",
+    schemaOutgoing: "From this class",
+    schemaIncoming: "To this class",
+    schemaNoRelationships: "No relationships yet.",
+    schemaConnectHint: "Connect using an existing relationship",
+    schemaConnectPlaceholder: "Search relationships…",
+    schemaConnectAs: "As",
+    schemaConnect: "Connect",
+    schemaConnected: (label: string) => `Connected via ${label}.`,
   },
   mapping: {
     title: "Data mapping",
@@ -1310,6 +1402,7 @@ export const en = {
       escalate_no_verdict: "The adjudicator returned no verdict",
       escalate_entity_changed: "The entity changed while being adjudicated",
       escalate_unsure: "The adjudicator was not confident enough",
+      namesake: "Two entities with this name in one document",
       /* 名字互相包含：等值召回看不见，简称会静默变成第二个实体 */
       contains: "One name contains the other",
       ambiguous_name: "Same name, context did not settle it",
@@ -1421,6 +1514,8 @@ export const en = {
     pendingNoPredicate: "The ontology has no relation for this; the word is the model's own.",
     pendingNoPredicateChip: "no relation in ontology",
     pendingSaidBy: (name: string) => `said by ${name}`,
+    /* 同一个人可以挂着好几个 agent，只写人名分不出是哪一个记的 */
+    pendingSaidVia: (name: string, agent: string) => `said by ${name} · via ${agent}`,
     nodCardTitle: (n: number) =>
       n === 1
         ? "One fact extracted from this. Confirm to add it to the graph, or reject."
@@ -1480,6 +1575,9 @@ export const en = {
     materialize: "Materialize inferences",
     materializeNote:
       "Write facts the ontology entails into the ledger — transitive chains and symmetric pairs. Off by default: a declaration can be wrong, and this one changes the graph. Derived facts are marked and can be taken back.",
+    autoResolveTypes: "Resolve entity types after extraction",
+    autoResolveTypesNote:
+      "After each document is extracted, run a round of type resolution on entities the engine has not looked at yet. Only refinements within the current class are applied on their own — a re-classification across the tree still waits for you on the Ontology page. Every batch is listed there and can be undone.",
     inferEvery: "Re-derive every",
     minutes: "minutes",
     lastInference: (when: string) => `last run ${when}`,
@@ -1575,6 +1673,7 @@ export const en = {
     systemAdmin: "System admin",
     remove: "Remove",
     deactivate: "Deactivate",
+    cancel: "Cancel",
     deactivateHint:
       "Cuts off access everywhere — sign-in and any token already issued. What they did stays attributed to them.",
     deactivatedTitle: "Deactivated accounts",

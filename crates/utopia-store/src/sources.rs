@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use utopia_core::models::{Role, Source, SourceKind, SourceView, SyncRun, SOURCE_SECRET_KEYS};
-use utopia_core::{AppError, AppResult};
+use utopia_core::{secrets, AppError, AppResult};
 use uuid::Uuid;
 
 /// folder = 纯容器（上传/拖拽入内，无同步语义）；url/rss = 拉取型；api = 推送型。
@@ -88,9 +88,11 @@ pub async fn list(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<SourceView>> {
         "SELECT s.id, s.kind, s.name, s.config - $2::text[] AS config, s.icon,
                 s.sync_interval_minutes, s.sync_cron,
                 s.last_sync_at, s.last_sync_status, s.last_sync_error, s.last_sync_added,
-                (SELECT count(*) FROM documents d WHERE d.source_id = s.id) AS doc_count,
                 (SELECT count(*) FROM documents d
-                 WHERE d.source_id = s.id AND d.missing_since IS NOT NULL) AS missing_count,
+                 WHERE d.source_id = s.id AND d.deleted_at IS NULL) AS doc_count,
+                (SELECT count(*) FROM documents d
+                 WHERE d.source_id = s.id AND d.missing_since IS NOT NULL
+                   AND d.deleted_at IS NULL) AS missing_count,
                 (SELECT r.activation_state FROM rss_full_content_sources r
                  WHERE r.source_id = s.id) AS rss_full_content_state,
                 (SELECT r.activation_generation FROM rss_full_content_sources r
@@ -126,12 +128,20 @@ pub async fn list(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<SourceView>> {
     Ok(rows)
 }
 
+/// 出库即开封：配置里的凭据键与推送密钥在库里是封印的（`utopia_core::secrets`）。
+/// 任何返回 `Source` 的查询都从这里过——`list` 不用，它在 SQL 里就把凭据键剔了
+fn opened(mut s: Source) -> AppResult<Source> {
+    secrets::open_json_keys(&mut s.config, SOURCE_SECRET_KEYS).map_err(AppError::Other)?;
+    s.ingest_token = secrets::open_opt(s.ingest_token.as_deref()).map_err(AppError::Other)?;
+    Ok(s)
+}
+
 pub async fn get(pool: &PgPool, id: Uuid) -> AppResult<Source> {
-    sqlx::query_as("SELECT * FROM sources WHERE id = $1")
+    let row: Option<Source> = sqlx::query_as("SELECT * FROM sources WHERE id = $1")
         .bind(id)
         .fetch_optional(pool)
-        .await?
-        .ok_or(AppError::NotFound)
+        .await?;
+    opened(row.ok_or(AppError::NotFound)?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -165,11 +175,12 @@ pub async fn create(
         sync_interval_minutes
     };
     // serde 缺省的 Value::Null 会以 jsonb null 落库，前端读 config.x 直接炸——规范化为空对象
-    let config = if config.is_null() {
+    let mut config = if config.is_null() {
         serde_json::json!({})
     } else {
         config.clone()
     };
+    secrets::seal_json_keys(&mut config, SOURCE_SECRET_KEYS);
     let full_content = rss_full_content_enabled(kind, &config)?;
     let source_id = Uuid::now_v7();
     let mut tx = pool.begin().await?;
@@ -191,14 +202,14 @@ pub async fn create(
         crate::rss_full_content::initialize_source(&mut tx, source.id).await?;
     }
     tx.commit().await?;
-    Ok(source)
+    opened(source)
 }
 
 /// 设置 api 来源的推送密钥（创建 / 轮换时）。
 pub async fn set_ingest_token(pool: &PgPool, source_id: Uuid, token: &str) -> AppResult<()> {
     let res = sqlx::query("UPDATE sources SET ingest_token = $2 WHERE id = $1")
         .bind(source_id)
-        .bind(token)
+        .bind(secrets::seal(token))
         .execute(pool)
         .await?;
     if res.rows_affected() == 0 {
@@ -240,7 +251,7 @@ pub async fn update(
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(AppError::NotFound)?;
-    let next_config = config
+    let mut next_config = config
         .map(|value| {
             if value.is_null() {
                 serde_json::json!({})
@@ -249,6 +260,7 @@ pub async fn update(
             }
         })
         .unwrap_or_else(|| previous.config.clone());
+    secrets::seal_json_keys(&mut next_config, SOURCE_SECRET_KEYS);
     let old_full = rss_full_content_enabled(&previous.kind, &previous.config)?;
     let new_full = rss_full_content_enabled(&previous.kind, &next_config)?;
     let feed_url_changed = previous.kind == "rss"
@@ -266,13 +278,7 @@ pub async fn update(
     )
     .bind(id)
     .bind(name)
-    .bind(config.map(|value| {
-        if value.is_null() {
-            serde_json::json!({})
-        } else {
-            value.clone()
-        }
-    }))
+    .bind(Some(next_config))
     .bind(icon)
     .bind(schedule.is_some())
     .bind(schedule.as_ref().and_then(|(i, _)| *i))
@@ -286,7 +292,7 @@ pub async fn update(
         crate::rss_full_content::disable_source(&mut tx, id).await?;
     }
     tx.commit().await?;
-    Ok(source)
+    opened(source)
 }
 
 /// 删除来源；其文档保留（source_id 置 NULL，落回 Uploads 组）。
@@ -316,6 +322,10 @@ pub async fn due_sources(pool: &PgPool) -> AppResult<Vec<Source>> {
     .await?;
 
     let now = chrono::Utc::now();
+    let rows = rows
+        .into_iter()
+        .map(opened)
+        .collect::<AppResult<Vec<_>>>()?;
     Ok(rows
         .into_iter()
         .filter(|s| match &s.sync_cron {

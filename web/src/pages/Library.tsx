@@ -352,7 +352,13 @@ export function Library() {
     queryKey: ["documents", kb?.id, selection, filter, graphFilter, page],
     queryFn: () =>
       api.documents(kb!.id, {
-        source: selection === "all" ? undefined : selection === "uploads" ? "none" : selection,
+        source:
+          selection === "all" || selection === "deleted"
+            ? undefined
+            : selection === "uploads"
+              ? "none"
+              : selection,
+        state: selection === "deleted" ? "deleted" : undefined,
         q: filter.trim() || undefined,
         graph: graphFilter || undefined,
         limit: PAGE_SIZE,
@@ -419,7 +425,36 @@ export function Library() {
     },
     onSuccess: invalidate,
   });
-  const remove = useMutation({ mutationFn: (id: string) => api.deleteDocument(id), onSuccess: invalidate });
+  // 删除是墓碑（#268）：提示里给一个「撤销」，点了原路复活
+  const restore = useMutation({
+    mutationFn: (id: string) => api.restoreDocument(id),
+    onSuccess: () => {
+      toast.success(S.library.restored);
+      invalidate();
+    },
+    onError: (e) => toast.error(String(e)),
+  });
+  const remove = useMutation({
+    mutationFn: (id: string) => api.deleteDocument(id),
+    onSuccess: (r, id) => {
+      toast.info(S.library.deletedWithFacts(r.invalidated_facts), {
+        label: S.library.undo,
+        onClick: () => restore.mutate(id),
+      });
+      invalidate();
+    },
+  });
+  // 真删（#268 下半）：打字级确认，库管理员，回不来
+  const [purging, setPurging] = useState<Doc | null>(null);
+  const purge = useMutation({
+    mutationFn: (id: string) => api.purgeDocument(id),
+    onSuccess: () => {
+      setPurging(null);
+      toast.success(S.library.purged);
+      invalidate();
+    },
+    onError: (e) => toast.error(String(e)),
+  });
   const extract = useMutation({ mutationFn: (id: string) => api.extractDocument(id), onSuccess: invalidate });
   const reprocess = useMutation({
     mutationFn: (id: string) => api.reprocessDocument(id),
@@ -535,7 +570,11 @@ export function Library() {
           <div className="flex items-center justify-between mb-4">
             <h1 className="u-title text-lg">
               {selectedSource?.name ??
-                (selection === "uploads" ? S.library.uploads : S.library.title)}
+                (selection === "uploads"
+                  ? S.library.uploads
+                  : selection === "deleted"
+                    ? S.library.deleted
+                    : S.library.title)}
             </h1>
             <div className="flex items-center gap-2">
               {/* 历史视图下过滤框只藏不撤（invisible 保留占位），标题行高度不塌、不抖 */}
@@ -563,6 +602,7 @@ export function Library() {
               {/* 按抽取状态筛。**选项写死成那五个**，不按库里实际有的填——
                   它是一组固定的管道状态，而「这个库现在没有失败的」正是用户
                   想通过筛一下确认的事 */}
+              {selection !== "deleted" && (
               <select
                 className="input-dark px-2 py-1.5 text-[13px] shrink-0"
                 value={graphFilter}
@@ -578,6 +618,7 @@ export function Library() {
                 <option value="extracting">{S.library.statusExtracting}</option>
                 <option value="none">{S.library.statusNone}</option>
               </select>
+              )}
               {/* 一键重试。**只在真有失败时出现**——没有失败的库不该看到一个
                   点了什么都不会发生的按钮。数字写在按钮上，点之前就知道会动几篇 */}
               {(docs.data?.failed ?? 0) > 0 && canUpload && (
@@ -674,7 +715,15 @@ export function Library() {
           ) : (
           <>
           <div className={`glass rounded-2xl glass-hover ${dragging ? "u-highlight" : ""}`}>
-            {pagedDocs.length ? (
+            {selection === "deleted" ? (
+              <DeletedTable
+                docs={pagedDocs}
+                sources={sourceList}
+                canPurge={canRebuild}
+                onRestore={(id) => restore.mutate(id)}
+                onPurge={setPurging}
+              />
+            ) : pagedDocs.length ? (
               <table className="w-full text-sm">
                 <thead>
                   <tr className="text-left text-xs text-neutral-500 border-b border-white/10">
@@ -812,6 +861,19 @@ export function Library() {
           file={dropsView.file}
           rows={dropsView.rows}
           onClose={() => setDropsView(null)}
+        />
+      )}
+      {/* 真删：打字级确认（内容没了，回不来） */}
+      {purging && (
+        <DangerConfirm
+          title={S.library.purgeTitle}
+          hint={S.library.purgeHint(purging.filename)}
+          requireText={purging.filename}
+          confirmLabel={S.library.purgeConfirm}
+          cancelLabel={S.library.cancel}
+          busy={purge.isPending}
+          onConfirm={() => purge.mutate(purging.id)}
+          onCancel={() => setPurging(null)}
         />
       )}
       {/* 全库重建：打字级确认（清空图层不可逆） */}
@@ -1177,6 +1239,12 @@ function TokenModal({
   const copy = (text: string, msg: string) =>
     navigator.clipboard.writeText(text).then(() => toast.success(msg)).catch(() => {});
   const endpoint = `${location.origin}/api/v1/sources/${sourceId}/ingest`;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   return (
     <div
       className="fixed inset-0 z-50 grid place-items-center bg-black/60 backdrop-blur-sm"
@@ -2145,6 +2213,69 @@ function SourceEditModal({
         />
       )}
     </div>
+  );
+}
+
+/** 「已删除」视图（#268）：墓碑在这里等着被恢复或清除。清除只有库管理员能按 */
+function DeletedTable({
+  docs,
+  sources,
+  canPurge,
+  onRestore,
+  onPurge,
+}: {
+  docs: Doc[];
+  sources: SourceView[];
+  canPurge: boolean;
+  onRestore: (id: string) => void;
+  onPurge: (doc: Doc) => void;
+}) {
+  if (!docs.length) {
+    return (
+      <div className="py-20 text-center text-sm text-neutral-500">{S.library.deletedEmpty}</div>
+    );
+  }
+  return (
+    <table className="w-full text-sm">
+      <thead>
+        <tr className="text-left text-xs text-neutral-500 border-b border-white/10">
+          <th className="px-4 py-2.5 font-medium">{S.library.colFile}</th>
+          <th className="px-4 py-2.5 font-medium">{S.library.colSource}</th>
+          <th className="px-4 py-2.5 font-medium">{S.library.colDeleted}</th>
+          <th className="px-4 py-2.5"></th>
+        </tr>
+      </thead>
+      <tbody>
+        {docs.map((d) => {
+          const src = sources.find((s) => s.id === d.source_id);
+          return (
+            <tr key={d.id} className="border-b border-white/[0.06] last:border-0">
+              <td className="px-4 py-2.5 text-neutral-300">{d.filename}</td>
+              <td className="px-4 py-2.5 text-neutral-500">{src?.name ?? S.library.uploads}</td>
+              <td className="px-4 py-2.5 u-num text-neutral-500">
+                {d.deleted_at ? new Date(d.deleted_at).toLocaleString() : ""}
+              </td>
+              <td className="px-4 py-2.5 text-right whitespace-nowrap">
+                <button
+                  onClick={() => onRestore(d.id)}
+                  className="text-xs text-neutral-400 hover:text-neutral-100"
+                >
+                  {S.library.restore}
+                </button>
+                {canPurge && (
+                  <button
+                    onClick={() => onPurge(d)}
+                    className="ml-4 text-xs text-neutral-500 hover:text-rose-400"
+                  >
+                    {S.library.purge}
+                  </button>
+                )}
+              </td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
   );
 }
 

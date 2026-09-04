@@ -105,6 +105,8 @@ export interface Kb {
   /** 把推出来的事实写进账本（R1）。**缺省关**——推理往图里加东西，
    *  而声明可能是错的，不该在用户没表态时就按它改图 */
   materialize_inferences: boolean;
+  /** 抽取结束自动排一轮类型消解（只自动落地子树内精化的那一档） */
+  auto_type_resolution: boolean;
   /** 多久重推一次（分钟）。事实持续在变，只靠手点会让派生一直是缺的 */
   inference_interval_minutes: number;
   /** 上次推完的时间 */
@@ -164,6 +166,10 @@ export interface Doc {
    *  `migrations/0002_ingest.sql` 的 `tags` 列上 */
   tags: string[];
   missing_since: string | null;
+  /** 墓碑（#268）：删了但留着，可撤销 */
+  deleted_at: string | null;
+  /** 真删过：内容没了，回不来 */
+  purged_at: string | null;
   created_at: string;
 }
 
@@ -613,6 +619,8 @@ export interface PendingFactItem {
   quote: string;
   proposed_by: string | null;
   proposed_by_name: string | null;
+  /** 经 MCP 记进来时，那个 agent 的令牌名；网页端对话里为空 */
+  proposed_token_name: string | null;
   created_at: string;
 }
 
@@ -769,6 +777,8 @@ export interface Evidence {
   doc_version: number;
   /** 文档已有更新版本（证据停留在旧版；不代表事实失效） */
   stale: boolean;
+  /** 这条证据的文档已被删除；事实还活着是因为另有出处（#268） */
+  document_deleted: boolean;
 }
 
 export interface ChunkFull {
@@ -990,6 +1000,10 @@ export type AlertGroup = {
   /** 明细，最多几条，新的在前 */
   lines: { name?: string; error?: string; job?: string }[];
 };
+
+/** 新库默认装的本体包。建库对话框和自动建出的第一个库都从这里取，
+ *  两处只能有一个答案：README 承诺的是「默认 schema.org」，不是「默认没有词表」 */
+export const DEFAULT_ONTOLOGY_PACKS = ["schema-org"];
 
 export const api = {
   health: () =>
@@ -1327,6 +1341,8 @@ export const api = {
       source?: string;
       q?: string;
       graph?: string;
+      /** "deleted" = 「已删除」视图：只列墓碑（#268） */
+      state?: "deleted";
       limit: number;
       offset: number;
     },
@@ -1338,6 +1354,7 @@ export const api = {
     if (opts.source) p.set("source", opts.source);
     if (opts.q) p.set("q", opts.q);
     if (opts.graph) p.set("graph", opts.graph);
+    if (opts.state) p.set("state", opts.state);
     return request<{
       docs: Doc[];
       total: number;
@@ -1346,6 +1363,8 @@ export const api = {
       ready: number;
       extracting: number;
       failed: number;
+      /** 整库的墓碑数（删了、没清的），不随作用域变 */
+      deleted: number;
     }>(`/api/v1/kbs/${kbId}/documents?${p}`);
   },
   /** 一键重试这个作用域里全部抽取失败的文档 */
@@ -1369,7 +1388,19 @@ export const api = {
     );
   },
   deleteDocument: (id: string) =>
-    request<{ ok: boolean }>(`/api/v1/documents/${id}`, { method: "DELETE" }),
+    request<{ ok: boolean; deletion_id: string; invalidated_facts: number }>(
+      `/api/v1/documents/${id}`,
+      { method: "DELETE" },
+    ),
+  /** 撤销删除（#268）：文档、分块、随之作废的事实原路复活 */
+  restoreDocument: (id: string) =>
+    request<{ ok: boolean }>(`/api/v1/documents/${id}/restore`, { method: "POST" }),
+  /** 真删（#268 下半）：只对已删除的开放，库管理员，不可撤销 */
+  purgeDocument: (id: string) =>
+    request<{ ok: boolean; chunks: number; blobs: number }>(
+      `/api/v1/documents/${id}/purge`,
+      { method: "POST" },
+    ),
 
   search: (kbId: string, q: string) =>
     request<{ results: SearchResult[] }>(`/api/v1/kbs/${kbId}/search`, {
@@ -1432,6 +1463,30 @@ export const api = {
       `/api/v1/kbs/${kbId}/entities/${entityId}`,
       { method: "PATCH", body: JSON.stringify(body) },
     ),
+
+  /** 人工修正一条事实的有效区间（302）。**整体替换**：四个值一起提交，
+   *  服务端作废旧行、插修正行——不是原地改，所以这次修改会出现在 History 上。 */
+  updateFactTime: (
+    kbId: string,
+    factId: string,
+    body: {
+      valid_from: string | null;
+      valid_from_precision: string | null;
+      valid_to: string | null;
+      valid_to_precision: string | null;
+      note?: string;
+    },
+  ) =>
+    request<{
+      ok: boolean;
+      unchanged?: boolean;
+      fact_id?: string;
+      closed?: number;
+      conflicts?: number;
+    }>(`/api/v1/kbs/${kbId}/facts/${factId}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
 
   entityHistory: (kbId: string, entityId: string, page: number, per = 30) =>
     request<{ events: EntityHistoryEvent[]; total: number }>(

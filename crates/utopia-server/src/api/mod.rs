@@ -3,7 +3,7 @@ mod alerts_routes;
 mod auth_routes;
 mod chat;
 mod datasource_routes;
-mod documents_routes;
+pub(crate) mod documents_routes;
 mod events_routes;
 mod graph_routes;
 mod jobs_routes;
@@ -276,6 +276,10 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
             "/documents/{id}",
             get(documents_routes::detail).delete(documents_routes::delete),
         )
+        // 撤销删除（#268）：删除是墓碑，所以有得撤
+        .route("/documents/{id}/restore", post(documents_routes::restore))
+        // 真删（#268 下半）：只对已删除的开放，库管理员
+        .route("/documents/{id}/purge", post(documents_routes::purge))
         .route("/documents/{id}/extract", post(graph_routes::extract))
         .route("/kbs/{id}/graph/overview", get(graph_routes::overview))
         .route(
@@ -294,6 +298,11 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
         .route(
             "/kbs/{id}/facts/{fact_id}/evidence",
             get(graph_routes::fact_evidence),
+        )
+        // 人工修正有效区间（302）：与实体的 PATCH 对称，走账本不原地改
+        .route(
+            "/kbs/{id}/facts/{fact_id}",
+            patch(graph_routes::update_fact_time),
         )
         // 派生事实的证明（0002 R2）：前提按顺序展开到原句
         .route(

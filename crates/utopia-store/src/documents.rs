@@ -1,6 +1,5 @@
 use pgvector::Vector;
-use sqlx::PgPool;
-use sqlx::{Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 use utopia_core::models::{ChunkView, Document, DocumentPage};
 use utopia_core::{AppError, AppResult};
 use utopia_ingest::ChunkPiece;
@@ -18,6 +17,19 @@ pub async fn create(
     doc_time: Option<chrono::DateTime<chrono::Utc>>,
     external_key: Option<&str>,
 ) -> AppResult<Document> {
+    // 同样的内容回来了，而它只是被删过：复活那一篇，而不是撞 (kb_id, sha256) 的唯一
+    // 索引报「已存在」。撤销删除的一种自然形态——重传就是「我要它回来」（#268）
+    if let Some((id,)) = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT id FROM documents
+          WHERE kb_id = $1 AND sha256 = $2 AND deleted_at IS NOT NULL AND purged_at IS NULL",
+    )
+    .bind(kb_id)
+    .bind(sha256)
+    .fetch_optional(pool)
+    .await?
+    {
+        return restore(pool, kb_id, id).await;
+    }
     sqlx::query_as(
         "INSERT INTO documents (id, kb_id, filename, mime, size_bytes, sha256, source_id,
                                 doc_time, doc_time_source, external_key)
@@ -47,8 +59,6 @@ pub async fn create(
     })
 }
 
-/// Create a document, its initial content version, and its processing job in
-/// one transaction. The blob must already be durable before this is called.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_with_version_and_processing(
     pool: &PgPool,
@@ -61,20 +71,44 @@ pub async fn create_with_version_and_processing(
     doc_time: Option<chrono::DateTime<chrono::Utc>>,
     external_key: Option<&str>,
 ) -> AppResult<Document> {
-    let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
-    let document = insert_document_tx(
-        &mut tx,
-        kb_id,
-        filename,
-        mime,
-        size_bytes,
-        sha256,
-        source_id,
-        doc_time,
-        external_key,
+    let mut tx = pool.begin().await?;
+    let document: Document = sqlx::query_as(
+        "INSERT INTO documents (id, kb_id, filename, mime, size_bytes, sha256, source_id,
+                                doc_time, doc_time_source, external_key)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, now()), $9, $10) RETURNING *",
     )
+    .bind(Uuid::now_v7())
+    .bind(kb_id)
+    .bind(filename)
+    .bind(mime)
+    .bind(size_bytes)
+    .bind(sha256)
+    .bind(source_id)
+    .bind(doc_time)
+    .bind(if doc_time.is_some() {
+        "source"
+    } else {
+        "upload_time"
+    })
+    .bind(external_key)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| match &e {
+        sqlx::Error::Database(db) if db.is_unique_violation() => AppError::Conflict(format!(
+            "File already exists (identical content): {filename}"
+        )),
+        _ => AppError::Db(e),
+    })?;
+    sqlx::query(
+        "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes)
+         VALUES ($1, $2, 1, $3, $4)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(document.id)
+    .bind(sha256)
+    .bind(size_bytes)
+    .execute(&mut *tx)
     .await?;
-    record_version_tx(&mut tx, document.id, sha256, size_bytes).await?;
     crate::jobs::enqueue_with_max_attempts_tx(
         &mut tx,
         "process_document",
@@ -86,19 +120,184 @@ pub async fn create_with_version_and_processing(
     Ok(document)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn insert_document_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    kb_id: Uuid,
+pub async fn replace_content_and_enqueue_processing(
+    pool: &PgPool,
+    id: Uuid,
     filename: &str,
     mime: &str,
     size_bytes: i64,
     sha256: &str,
-    source_id: Option<Uuid>,
     doc_time: Option<chrono::DateTime<chrono::Utc>>,
-    external_key: Option<&str>,
+) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+    let exists: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM documents WHERE id = $1 AND deleted_at IS NULL FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if exists.is_none() {
+        return Err(AppError::NotFound);
+    }
+    sqlx::query(
+        "UPDATE documents SET filename = $2, mime = $3, size_bytes = $4, sha256 = $5,
+                doc_time = COALESCE($6, doc_time),
+                doc_time_source = CASE WHEN $6 IS NULL THEN doc_time_source ELSE 'source' END,
+                status = 'pending', graph_status = 'none', error = NULL,
+                missing_since = NULL, updated_at = now()
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(filename)
+    .bind(mime)
+    .bind(size_bytes)
+    .bind(sha256)
+    .bind(doc_time)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes)
+         VALUES ($1, $2,
+                 (SELECT coalesce(max(version), 0) + 1 FROM document_versions WHERE document_id = $2),
+                 $3, $4)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(id)
+    .bind(sha256)
+    .bind(size_bytes)
+    .execute(&mut *tx)
+    .await?;
+    crate::jobs::enqueue_with_max_attempts_tx(
+        &mut tx,
+        "process_document",
+        serde_json::json!({ "document_id": id }),
+        3,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_source_document_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    kb_id: Uuid,
+    source_id: Uuid,
+    external_key: &str,
+    filename: &str,
+    mime: &str,
+    size_bytes: i64,
+    sha256: &str,
+    doc_time: Option<chrono::DateTime<chrono::Utc>>,
 ) -> AppResult<Document> {
-    sqlx::query_as(
+    let existing: Option<Document> = sqlx::query_as(
+        "SELECT * FROM documents
+          WHERE source_id = $1 AND external_key = $2 AND deleted_at IS NULL
+          FOR UPDATE",
+    )
+    .bind(source_id)
+    .bind(external_key)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(document) = existing {
+        if document.sha256 == sha256 {
+            return Ok(document);
+        }
+        sqlx::query(
+            "UPDATE documents SET filename = $2, mime = $3, size_bytes = $4, sha256 = $5,
+                    doc_time = COALESCE($6, doc_time), status = 'pending', graph_status = 'none',
+                    error = NULL, missing_since = NULL, updated_at = now()
+             WHERE id = $1",
+        )
+        .bind(document.id)
+        .bind(filename)
+        .bind(mime)
+        .bind(size_bytes)
+        .bind(sha256)
+        .bind(doc_time)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes)
+             VALUES ($1, $2,
+                     (SELECT coalesce(max(version), 0) + 1 FROM document_versions WHERE document_id = $2),
+                     $3, $4)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(document.id)
+        .bind(sha256)
+        .bind(size_bytes)
+        .execute(&mut **tx)
+        .await?;
+        crate::jobs::enqueue_with_max_attempts_tx(
+            tx,
+            "process_document",
+            serde_json::json!({ "document_id": document.id }),
+            3,
+        )
+        .await?;
+        return Ok(sqlx::query_as("SELECT * FROM documents WHERE id = $1")
+            .bind(document.id)
+            .fetch_one(&mut **tx)
+            .await?);
+    }
+
+    if let Some(document) = sqlx::query_as::<_, Document>(
+        "SELECT * FROM documents
+          WHERE source_id = $1 AND external_key IS NULL AND filename = $2
+            AND deleted_at IS NULL LIMIT 1 FOR UPDATE",
+    )
+    .bind(source_id)
+    .bind(filename)
+    .fetch_optional(&mut **tx)
+    .await?
+    {
+        sqlx::query("UPDATE documents SET external_key = $2, updated_at = now() WHERE id = $1")
+            .bind(document.id)
+            .bind(external_key)
+            .execute(&mut **tx)
+            .await?;
+        if document.sha256 != sha256 {
+            sqlx::query(
+                "UPDATE documents SET filename = $2, mime = $3, size_bytes = $4, sha256 = $5,
+                        doc_time = COALESCE($6, doc_time), status = 'pending', graph_status = 'none',
+                        error = NULL, missing_since = NULL, updated_at = now()
+                 WHERE id = $1",
+            )
+            .bind(document.id)
+            .bind(filename)
+            .bind(mime)
+            .bind(size_bytes)
+            .bind(sha256)
+            .bind(doc_time)
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes)
+                 VALUES ($1, $2,
+                         (SELECT coalesce(max(version), 0) + 1 FROM document_versions WHERE document_id = $2),
+                         $3, $4)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(document.id)
+            .bind(sha256)
+            .bind(size_bytes)
+            .execute(&mut **tx)
+            .await?;
+            crate::jobs::enqueue_with_max_attempts_tx(
+                tx,
+                "process_document",
+                serde_json::json!({ "document_id": document.id }),
+                3,
+            )
+            .await?;
+        }
+        return Ok(sqlx::query_as("SELECT * FROM documents WHERE id = $1")
+            .bind(document.id)
+            .fetch_one(&mut **tx)
+            .await?);
+    }
+
+    let document: Document = sqlx::query_as(
         "INSERT INTO documents (id, kb_id, filename, mime, size_bytes, sha256, source_id,
                                 doc_time, doc_time_source, external_key)
          VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, now()), $9, $10) RETURNING *",
@@ -124,186 +323,17 @@ async fn insert_document_tx(
             "File already exists (identical content): {filename}"
         )),
         _ => AppError::Db(e),
-    })
-}
-
-async fn record_version_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    document_id: Uuid,
-    sha256: &str,
-    size_bytes: i64,
-) -> AppResult<()> {
+    })?;
     sqlx::query(
         "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes)
-         VALUES ($1, $2,
-                 (SELECT coalesce(max(version), 0) + 1
-                    FROM document_versions
-                   WHERE document_id = $2),
-                 $3, $4)",
+         VALUES ($1, $2, 1, $3, $4)",
     )
     .bind(Uuid::now_v7())
-    .bind(document_id)
+    .bind(document.id)
     .bind(sha256)
     .bind(size_bytes)
     .execute(&mut **tx)
     .await?;
-    Ok(())
-}
-
-async fn replace_content_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    id: Uuid,
-    filename: &str,
-    mime: &str,
-    size_bytes: i64,
-    sha256: &str,
-    doc_time: Option<chrono::DateTime<chrono::Utc>>,
-) -> AppResult<()> {
-    sqlx::query(
-        "UPDATE documents SET filename = $2, mime = $3, size_bytes = $4, sha256 = $5,
-                doc_time = COALESCE($6, doc_time),
-                doc_time_source = CASE WHEN $6 IS NULL THEN doc_time_source ELSE 'source' END,
-                status = 'pending', graph_status = 'none', error = NULL,
-                missing_since = NULL, updated_at = now()
-         WHERE id = $1",
-    )
-    .bind(id)
-    .bind(filename)
-    .bind(mime)
-    .bind(size_bytes)
-    .bind(sha256)
-    .bind(doc_time)
-    .execute(&mut **tx)
-    .await?;
-    record_version_tx(tx, id, sha256, size_bytes).await?;
-    crate::jobs::enqueue_with_max_attempts_tx(
-        tx,
-        "process_document",
-        serde_json::json!({ "document_id": id }),
-        3,
-    )
-    .await?;
-    Ok(())
-}
-
-/// Upsert one source-owned document while an outer transaction holds the
-/// source/entry claim. This is the fenced path used by RSS hydration.
-#[allow(clippy::too_many_arguments)]
-pub async fn upsert_source_document_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    kb_id: Uuid,
-    source_id: Uuid,
-    external_key: &str,
-    filename: &str,
-    mime: &str,
-    size_bytes: i64,
-    sha256: &str,
-    doc_time: Option<chrono::DateTime<chrono::Utc>>,
-) -> AppResult<Document> {
-    let existing: Option<Document> = sqlx::query_as(
-        "SELECT * FROM documents
-          WHERE source_id = $1 AND external_key = $2
-          FOR UPDATE",
-    )
-    .bind(source_id)
-    .bind(external_key)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if let Some(document) = existing {
-        if document.sha256 != sha256 {
-            replace_content_tx(
-                tx,
-                document.id,
-                filename,
-                mime,
-                size_bytes,
-                sha256,
-                doc_time,
-            )
-            .await?;
-            return Ok(sqlx::query_as("SELECT * FROM documents WHERE id = $1")
-                .bind(document.id)
-                .fetch_one(&mut **tx)
-                .await?);
-        }
-        return Ok(document);
-    }
-
-    // Migrate a pre-external-key RSS document without losing its original
-    // content version. All adoption and replacement writes share this tx.
-    let legacy: Option<Document> = sqlx::query_as(
-        "SELECT * FROM documents
-          WHERE source_id = $1 AND external_key IS NULL AND filename = $2
-          LIMIT 1 FOR UPDATE",
-    )
-    .bind(source_id)
-    .bind(filename)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if let Some(document) = legacy {
-        sqlx::query("UPDATE documents SET external_key = $2, updated_at = now() WHERE id = $1")
-            .bind(document.id)
-            .bind(external_key)
-            .execute(&mut **tx)
-            .await?;
-        record_version_tx(&mut *tx, document.id, &document.sha256, document.size_bytes).await?;
-        if document.sha256 != sha256 {
-            replace_content_tx(
-                tx,
-                document.id,
-                filename,
-                mime,
-                size_bytes,
-                sha256,
-                doc_time,
-            )
-            .await?;
-        }
-        return Ok(sqlx::query_as("SELECT * FROM documents WHERE id = $1")
-            .bind(document.id)
-            .fetch_one(&mut **tx)
-            .await?);
-    }
-
-    if let Some(document) = sqlx::query_as::<_, Document>(
-        "SELECT * FROM documents
-          WHERE source_id = $1 AND sha256 = $2
-          LIMIT 1 FOR UPDATE",
-    )
-    .bind(source_id)
-    .bind(sha256)
-    .fetch_optional(&mut **tx)
-    .await?
-    {
-        sqlx::query(
-            "UPDATE documents SET filename = $2, external_key = $3,
-                    missing_since = NULL, updated_at = now()
-              WHERE id = $1",
-        )
-        .bind(document.id)
-        .bind(filename)
-        .bind(external_key)
-        .execute(&mut **tx)
-        .await?;
-        return Ok(sqlx::query_as("SELECT * FROM documents WHERE id = $1")
-            .bind(document.id)
-            .fetch_one(&mut **tx)
-            .await?);
-    }
-
-    let document = insert_document_tx(
-        tx,
-        kb_id,
-        filename,
-        mime,
-        size_bytes,
-        sha256,
-        Some(source_id),
-        doc_time,
-        Some(external_key),
-    )
-    .await?;
-    record_version_tx(tx, document.id, sha256, size_bytes).await?;
     crate::jobs::enqueue_with_max_attempts_tx(
         tx,
         "process_document",
@@ -315,10 +345,12 @@ pub async fn upsert_source_document_tx(
 }
 
 pub async fn list(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Document>> {
-    let rows = sqlx::query_as("SELECT * FROM documents WHERE kb_id = $1 ORDER BY created_at DESC")
-        .bind(kb_id)
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query_as(
+        "SELECT * FROM documents WHERE kb_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC",
+    )
+    .bind(kb_id)
+    .fetch_all(pool)
+    .await?;
     Ok(rows)
 }
 
@@ -338,6 +370,8 @@ pub async fn page(
     source: Option<Option<Uuid>>,
     q: Option<&str>,
     graph_status: Option<&str>,
+    // true = 「已删除」视图：只列墓碑（删了、没清的）；false = 活着的
+    deleted: bool,
     limit: i64,
     offset: i64,
 ) -> AppResult<DocumentPage> {
@@ -346,6 +380,8 @@ pub async fn page(
     // 用两个哨兵字符串而不是两个可空参数，因为 NULL 在这里有歧义：
     // 它既可能是「不筛」，也可能是「筛出 source_id IS NULL 的」
     const WHERE: &str = "WHERE kb_id = $1
+           AND (($5::bool AND deleted_at IS NOT NULL AND purged_at IS NULL)
+                OR (NOT $5::bool AND deleted_at IS NULL))
            AND ($2 = 'any'
                 OR ($2 = 'none' AND source_id IS NULL)
                 OR source_id::text = $2)
@@ -358,12 +394,15 @@ pub async fn page(
     };
 
     let docs: Vec<Document> = sqlx::query_as(&format!(
-        "SELECT * FROM documents {WHERE} ORDER BY created_at DESC LIMIT $5 OFFSET $6"
+        "SELECT * FROM documents {WHERE}
+         ORDER BY (CASE WHEN $5::bool THEN deleted_at ELSE created_at END) DESC
+         LIMIT $6 OFFSET $7"
     ))
     .bind(kb_id)
     .bind(&scope)
     .bind(q)
     .bind(graph_status)
+    .bind(deleted)
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)
@@ -374,6 +413,7 @@ pub async fn page(
         .bind(&scope)
         .bind(q)
         .bind(graph_status)
+        .bind(deleted)
         .fetch_one(pool)
         .await?;
 
@@ -384,7 +424,7 @@ pub async fn page(
            count(*) FILTER (WHERE graph_status IN ('queued', 'extracting')),
            count(*) FILTER (WHERE graph_status = 'failed')
          FROM documents
-         WHERE kb_id = $1
+         WHERE kb_id = $1 AND deleted_at IS NULL
            AND ($2 = 'any'
                 OR ($2 = 'none' AND source_id IS NULL)
                 OR source_id::text = $2)",
@@ -394,12 +434,22 @@ pub async fn page(
     .fetch_one(pool)
     .await?;
 
+    // 墓碑数是整库的：左栏那一行不随作用域变
+    let (deleted_total,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM documents
+          WHERE kb_id = $1 AND deleted_at IS NOT NULL AND purged_at IS NULL",
+    )
+    .bind(kb_id)
+    .fetch_one(pool)
+    .await?;
+
     Ok(DocumentPage {
         docs,
         total,
         ready: stats.0,
         extracting: stats.1,
         failed: stats.2,
+        deleted: deleted_total,
     })
 }
 
@@ -416,7 +466,7 @@ pub async fn failed_ids(
     };
     Ok(sqlx::query_scalar(
         "SELECT id FROM documents
-          WHERE kb_id = $1 AND graph_status = 'failed'
+          WHERE kb_id = $1 AND deleted_at IS NULL AND graph_status = 'failed'
             AND ($2 = 'any'
                  OR ($2 = 'none' AND source_id IS NULL)
                  OR source_id::text = $2)",
@@ -438,13 +488,13 @@ pub async fn get(pool: &PgPool, id: Uuid) -> AppResult<Document> {
 /// 按 kb 收窄的取文档。**id 由模型给出时只能走这一支**：`get` 只按 id 查，
 /// 一个别的库的 id 照样查得到。
 pub async fn find_in_kb(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResult<Option<Document>> {
-    Ok(
-        sqlx::query_as("SELECT * FROM documents WHERE id = $1 AND kb_id = $2")
-            .bind(id)
-            .bind(kb_id)
-            .fetch_optional(pool)
-            .await?,
+    Ok(sqlx::query_as(
+        "SELECT * FROM documents WHERE id = $1 AND kb_id = $2 AND deleted_at IS NULL",
     )
+    .bind(id)
+    .bind(kb_id)
+    .fetch_optional(pool)
+    .await?)
 }
 
 /// 按来源内逻辑身份查文档（同步三路判定用）。
@@ -468,29 +518,14 @@ pub async fn find_by_source_sha(
     source_id: Uuid,
     sha256: &str,
 ) -> AppResult<Option<Document>> {
-    Ok(
-        sqlx::query_as("SELECT * FROM documents WHERE source_id = $1 AND sha256 = $2 LIMIT 1")
-            .bind(source_id)
-            .bind(sha256)
-            .fetch_optional(pool)
-            .await?,
+    Ok(sqlx::query_as(
+        "SELECT * FROM documents
+              WHERE source_id = $1 AND sha256 = $2 AND deleted_at IS NULL LIMIT 1",
     )
-}
-
-/// KB 内按内容哈希找已有文档：来源身份不同但内容相同的冲突，也必须返回
-/// 真实 document_id，供 durable hydration 的 replay 收尾使用。
-pub async fn find_by_kb_sha(
-    pool: &PgPool,
-    kb_id: Uuid,
-    sha256: &str,
-) -> AppResult<Option<Document>> {
-    Ok(
-        sqlx::query_as("SELECT * FROM documents WHERE kb_id = $1 AND sha256 = $2 LIMIT 1")
-            .bind(kb_id)
-            .bind(sha256)
-            .fetch_optional(pool)
-            .await?,
-    )
+    .bind(source_id)
+    .bind(sha256)
+    .fetch_optional(pool)
+    .await?)
 }
 
 /// 迁移前的历史文档（无 external_key）按文件名认领——0008 之前建的行的一次性兜底。
@@ -501,7 +536,8 @@ pub async fn find_legacy_by_filename(
 ) -> AppResult<Option<Document>> {
     Ok(sqlx::query_as(
         "SELECT * FROM documents
-         WHERE source_id = $1 AND external_key IS NULL AND filename = $2 LIMIT 1",
+         WHERE source_id = $1 AND external_key IS NULL AND filename = $2
+           AND deleted_at IS NULL LIMIT 1",
     )
     .bind(source_id)
     .bind(filename)
@@ -545,71 +581,6 @@ pub async fn replace_content(
     .bind(doc_time)
     .execute(pool)
     .await?;
-    Ok(())
-}
-
-/// Replace a document and enqueue its processing job as one database transaction.
-/// The content-addressed blob must already be durable before this function is called.
-#[allow(clippy::too_many_arguments)]
-pub async fn replace_content_and_enqueue_processing(
-    pool: &PgPool,
-    id: Uuid,
-    filename: &str,
-    mime: &str,
-    size_bytes: i64,
-    sha256: &str,
-    doc_time: Option<chrono::DateTime<chrono::Utc>>,
-) -> AppResult<()> {
-    let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
-    let exists: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM documents WHERE id = $1 FOR UPDATE")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    if exists.is_none() {
-        return Err(AppError::NotFound);
-    }
-
-    sqlx::query(
-        "UPDATE documents SET filename = $2, mime = $3, size_bytes = $4, sha256 = $5,
-                doc_time = COALESCE($6, doc_time),
-                doc_time_source = CASE WHEN $6 IS NULL THEN doc_time_source ELSE 'source' END,
-                status = 'pending', graph_status = 'none', error = NULL,
-                missing_since = NULL, updated_at = now()
-         WHERE id = $1",
-    )
-    .bind(id)
-    .bind(filename)
-    .bind(mime)
-    .bind(size_bytes)
-    .bind(sha256)
-    .bind(doc_time)
-    .execute(&mut *tx)
-    .await?;
-
-    sqlx::query(
-        "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes)
-         VALUES ($1, $2,
-                 (SELECT coalesce(max(version), 0) + 1
-                    FROM document_versions
-                   WHERE document_id = $2),
-                 $3, $4)",
-    )
-    .bind(Uuid::now_v7())
-    .bind(id)
-    .bind(sha256)
-    .bind(size_bytes)
-    .execute(&mut *tx)
-    .await?;
-
-    crate::jobs::enqueue_with_max_attempts_tx(
-        &mut tx,
-        "process_document",
-        serde_json::json!({ "document_id": id }),
-        3,
-    )
-    .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -704,7 +675,8 @@ pub async fn mark_missing_keys(pool: &PgPool, source_id: Uuid, keys: &[String]) 
 /// 该来源下所有已标记 missing 的文档 id（批量清理用）。
 pub async fn list_missing(pool: &PgPool, source_id: Uuid) -> AppResult<Vec<Uuid>> {
     let rows: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM documents WHERE source_id = $1 AND missing_since IS NOT NULL",
+        "SELECT id FROM documents
+          WHERE source_id = $1 AND missing_since IS NOT NULL AND deleted_at IS NULL",
     )
     .bind(source_id)
     .fetch_all(pool)
@@ -745,18 +717,232 @@ pub async fn set_ready(pool: &PgPool, id: Uuid, text_len: i32, chunk_count: i32)
     Ok(())
 }
 
-pub async fn delete(pool: &PgPool, id: Uuid) -> AppResult<()> {
-    let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
+/// 一次删除的产出，给审计与界面提示用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeletionReport {
+    pub deletion_id: Uuid,
+    /// 随之作废的事实：只有「每条出处都已删除」的那些
+    pub invalidated_facts: usize,
+    pub superseded_chunks: usize,
+}
+
+/// 删除一篇文档——**认知轴上的一个事件，不是减法**（#268）。
+///
+/// 从前这里一句 `DELETE`，外键把分块与证据一并级联掉：事实留在图里、活着、却没了
+/// 出处，而隐私政策写着「事实连同其出处保留」。现在文档打墓碑，分块走 `replace_chunks`
+/// 用了很久的 `superseded_at`，**什么内容都不清**——原始文件本来也没删过；只作废
+/// 「每条出处都已删除」的事实。判据看 `documents.deleted_at` 而不是分块的
+/// `superseded_at`：证据停在文档**旧版本**上的事实是 stale，按 `stale_facts` 的规矩
+/// 「没再提 ≠ 不成立」，交给人、不作废；只有源本身没了才作废。
+///
+/// 作废的事实与打标的分块记进 `document_deletions`，[`restore`] 原路读回。
+/// `actor` 为 None = 引擎（来源对账的批量清理）
+pub async fn delete(
+    pool: &PgPool,
+    kb_id: Uuid,
+    id: Uuid,
+    actor: Option<Uuid>,
+) -> AppResult<DeletionReport> {
+    let mut tx = pool.begin().await?;
     crate::rss_full_content::detach_document_tx(&mut tx, id).await?;
-    let res = sqlx::query("DELETE FROM documents WHERE id = $1")
+    let hit = sqlx::query(
+        "UPDATE documents SET deleted_at = now(), updated_at = now()
+          WHERE id = $1 AND kb_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .bind(kb_id)
+    .execute(&mut *tx)
+    .await?;
+    if hit.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    let chunks: Vec<(Uuid,)> = sqlx::query_as(
+        "UPDATE chunks SET superseded_at = now()
+          WHERE document_id = $1 AND superseded_at IS NULL RETURNING id",
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
+    // 先打了墓碑再算：这篇文档此刻已经算「已删除」，所以只剩它作出处的事实才落网；
+    // 另一篇活着的文档里也有证据的一条不动——删一份重复上传不该掀掉半张图
+    let facts: Vec<(Uuid,)> = sqlx::query_as(
+        "UPDATE facts f SET invalidated_at = now()
+          WHERE f.kb_id = $1 AND f.invalidated_at IS NULL
+            AND EXISTS (SELECT 1 FROM fact_evidence fe
+                        JOIN chunks c ON c.id = fe.chunk_id
+                        WHERE fe.fact_id = f.id AND c.document_id = $2)
+            AND NOT EXISTS (SELECT 1 FROM fact_evidence fe
+                            JOIN chunks c ON c.id = fe.chunk_id
+                            JOIN documents d ON d.id = c.document_id
+                            WHERE fe.fact_id = f.id AND d.deleted_at IS NULL)
+          RETURNING f.id",
+    )
+    .bind(kb_id)
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let chunk_ids: Vec<Uuid> = chunks.into_iter().map(|(c,)| c).collect();
+    let fact_ids: Vec<Uuid> = facts.into_iter().map(|(f,)| f).collect();
+    let deletion_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO document_deletions
+            (id, kb_id, document_id, deleted_by, invalidated_facts, superseded_chunks)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(deletion_id)
+    .bind(kb_id)
+    .bind(id)
+    .bind(actor)
+    .bind(&fact_ids)
+    .bind(&chunk_ids)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(DeletionReport {
+        deletion_id,
+        invalidated_facts: fact_ids.len(),
+        superseded_chunks: chunk_ids.len(),
+    })
+}
+
+/// 撤销一次删除：文档、这次打标的分块、这次作废的事实原路复活，形状照 `revert_merge`。
+///
+/// 只救 `document_deletions` 名单上的——更早版本的旧分块、删除之前就作废的事实
+/// 都不在名单里。三条路都从这里走：人点撤销、同步撞见墓碑、同内容重传
+pub async fn restore(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResult<Document> {
+    let row: Option<(Uuid, Vec<Uuid>, Vec<Uuid>)> = sqlx::query_as(
+        "SELECT id, invalidated_facts, superseded_chunks FROM document_deletions
+          WHERE document_id = $1 AND kb_id = $2 AND reverted_at IS NULL
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(id)
+    .bind(kb_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((deletion_id, fact_ids, chunk_ids)) = row else {
+        return Err(AppError::Conflict("Document is not deleted".into()));
+    };
+    // 清过的没东西可复活：分块、原文都不在了
+    let purged: bool =
+        sqlx::query_scalar("SELECT purged_at IS NOT NULL FROM documents WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await?;
+    if purged {
+        return Err(AppError::Conflict(
+            "The document's content was purged; there is nothing to restore".into(),
+        ));
+    }
+    let mut tx = pool.begin().await?;
+    let hit = sqlx::query(
+        "UPDATE documents SET deleted_at = NULL, updated_at = now()
+          WHERE id = $1 AND kb_id = $2 AND deleted_at IS NOT NULL",
+    )
+    .bind(id)
+    .bind(kb_id)
+    .execute(&mut *tx)
+    .await?;
+    if hit.rows_affected() == 0 {
+        return Err(AppError::Conflict("Document is not deleted".into()));
+    }
+    sqlx::query("UPDATE chunks SET superseded_at = NULL WHERE id = ANY($1)")
+        .bind(&chunk_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE facts SET invalidated_at = NULL
+          WHERE id = ANY($1) AND invalidated_at IS NOT NULL",
+    )
+    .bind(&fact_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE document_deletions SET reverted_at = now() WHERE id = $1")
+        .bind(deletion_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    get(pool, id).await
+}
+
+/// 一次真删的产出。`blobs` 是这篇（连同历史版本）独占的原文指纹——别处还引用的
+/// 不在名单上。BlobStore 归服务端，删文件由调用方做
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurgeReport {
+    pub blobs: Vec<String>,
+    pub chunks: u64,
+}
+
+/// 真删（#268 下半）：把内容真的抹掉，**只对已删除的文档开放，不可撤销**。
+///
+/// 删除是事件、可撤销（[`delete`] / [`restore`]）；这里是另一个动作：分块行删掉
+/// （证据引文随外键级联）、版本行删掉、文档行留作墓碑打 `purged_at`。`external_key`
+/// 清空——身份让出来，同步源里若还有这篇，下次同步当新文档重新摄入；同一份内容也
+/// 可以再传（唯一索引只管没清的行）。事实保持作废，`document_deletions` 那条账留着：
+/// 「曾经有过这么一篇，某时被删、某时被清」
+pub async fn purge(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResult<PurgeReport> {
+    let mut tx = pool.begin().await?;
+    type Stamp = Option<chrono::DateTime<chrono::Utc>>;
+    let row: Option<(String, Stamp, Stamp)> = sqlx::query_as(
+        "SELECT sha256, deleted_at, purged_at FROM documents
+          WHERE id = $1 AND kb_id = $2 FOR UPDATE",
+    )
+    .bind(id)
+    .bind(kb_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((sha, deleted_at, purged_at)) = row else {
+        return Err(AppError::NotFound);
+    };
+    if purged_at.is_some() {
+        return Err(AppError::Conflict("The document was already purged".into()));
+    }
+    if deleted_at.is_none() {
+        return Err(AppError::Conflict(
+            "Delete the document before purging it".into(),
+        ));
+    }
+    let mut shas: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT sha256 FROM document_versions WHERE document_id = $1")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+    if !shas.contains(&sha) {
+        shas.push(sha);
+    }
+    let chunks = sqlx::query("DELETE FROM chunks WHERE document_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    sqlx::query("DELETE FROM document_versions WHERE document_id = $1")
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    if res.rows_affected() == 0 {
-        return Err(AppError::NotFound);
+    sqlx::query(
+        "UPDATE documents
+            SET purged_at = now(), external_key = NULL, text_len = 0, chunk_count = 0,
+                updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    // 原文按内容寻址，别的文档（任何库）可能共用同一份：只交出没人再引用的
+    let mut blobs = Vec::new();
+    for s in shas {
+        let (referenced,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM documents WHERE sha256 = $1 AND purged_at IS NULL)
+                 OR EXISTS (SELECT 1 FROM document_versions WHERE sha256 = $1)",
+        )
+        .bind(&s)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !referenced {
+            blobs.push(s);
+        }
     }
     tx.commit().await?;
-    Ok(())
+    Ok(PurgeReport { blobs, chunks })
 }
 
 /// 重建文档分块（事务内，幂等）。返回 (chunk_id, text) 供全文索引。
@@ -1013,7 +1199,8 @@ pub async fn chunks_by_ids(pool: &PgPool, kb_id: Uuid, ids: &[Uuid]) -> AppResul
     let rows: Vec<ChunkView> = sqlx::query_as(
         "SELECT c.id, c.document_id, c.seq, c.text, d.filename
          FROM chunks c JOIN documents d ON d.id = c.document_id
-         WHERE c.kb_id = $1 AND c.id = ANY($2)",
+         WHERE c.kb_id = $1 AND c.id = ANY($2)
+           AND c.superseded_at IS NULL AND d.deleted_at IS NULL",
     )
     .bind(kb_id)
     .bind(ids)
@@ -1060,7 +1247,8 @@ pub async fn queue_extraction(
     let mut tx = pool.begin().await?;
     let ids: Vec<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM documents
-         WHERE kb_id = $1 AND status = 'ready' AND ($2::uuid IS NULL OR source_id = $2)
+         WHERE kb_id = $1 AND deleted_at IS NULL AND status = 'ready'
+           AND ($2::uuid IS NULL OR source_id = $2)
          ORDER BY created_at",
     )
     .bind(kb_id)
@@ -1140,7 +1328,7 @@ pub async fn extract_epoch(pool: &PgPool, id: Uuid) -> AppResult<i32> {
 pub async fn extraction_idle(pool: &PgPool, kb_id: Uuid) -> AppResult<bool> {
     let (pending,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM documents
-         WHERE kb_id = $1 AND graph_status IN ('queued', 'extracting')",
+         WHERE kb_id = $1 AND deleted_at IS NULL AND graph_status IN ('queued', 'extracting')",
     )
     .bind(kb_id)
     .fetch_one(pool)

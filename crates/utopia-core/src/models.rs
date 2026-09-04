@@ -106,6 +106,11 @@ pub struct Document {
     pub external_key: Option<String>,
     /// watch_folder 同步时发现源文件已消失（默认保留文档，仅标记）
     pub missing_since: Option<DateTime<Utc>>,
+    /// 墓碑（#268）：删除是认知轴上的一个事件。行、分块、证据、原始文件都留着，
+    /// 只是不再算活的；撤销、同步撞见、同内容重传都能把它复活
+    pub deleted_at: Option<DateTime<Utc>>,
+    /// 真删（#268 下半）：内容已抹掉，回不来。行留作墓碑
+    pub purged_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -808,6 +813,8 @@ pub struct EvidenceView {
     pub doc_version: i32,
     /// 文档已有更新的版本（证据停留在旧版；不代表事实失效）
     pub stale: bool,
+    /// 这条证据所在的文档已被删除（#268）。事实若还活着，是因为它另有出处
+    pub document_deleted: bool,
 }
 
 /// 时态冲突（S3 自动闭合拿不准的那些）：旧事实 vs 新事实，Review 页人裁。
@@ -861,6 +868,9 @@ pub struct KnowledgeBase {
     /// 而 0001 判据 2 说「本体是引导不是执法」：声明可能是错的，不该在用户
     /// 没表态时就按它改图
     pub materialize_inferences: bool,
+    /// 抽取结束自动排一轮类型消解（0016 C2）。**只自动落地在原类子树里精化的那一档**，
+    /// 跨轴的改判仍留给人。缺省开：基准上自动那一档的命中 39/41（#297），且每批可撤
+    pub auto_type_resolution: bool,
     /// 多久重推一次（分钟）。见 `knowledge_bases.inference_interval_minutes`
     pub inference_interval_minutes: i32,
     /// 上次推完的时间。**答的是「上次看过没有」，不是「上次改过没有」**
@@ -1135,7 +1145,22 @@ pub struct PendingFactView {
     pub quote: String,
     pub proposed_by: Option<Uuid>,
     pub proposed_by_name: Option<String>,
+    /// 经 MCP 记进来时，那枚令牌的名字（0014 里人给 agent 起的名）。
+    /// 网页端对话记的记忆这一位是空的——那时「谁说的」就是那个人本人
+    pub proposed_token_name: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+/// 一句记忆是谁提的。
+///
+/// **两层，不是一层**：`user_id` 是人（令牌代表的就是他，0014），`token_id` 是
+/// 他挂在这个库上的哪一个 agent。同一个人可以同时连着三个客户端，只记人
+/// 就等于让审核的人在三条一模一样的「张三说的」之间猜。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Proposer {
+    pub user_id: Option<Uuid>,
+    /// None = 不经 MCP（网页端对话，或批量摄入）
+    pub token_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, sqlx::FromRow)]
@@ -1194,6 +1219,8 @@ pub struct DocumentPage {
     pub ready: i64,
     pub extracting: i64,
     pub failed: i64,
+    /// 整库的墓碑数（删了、没清的）——左栏「已删除」那一行的数字，不随作用域变
+    pub deleted: i64,
 }
 
 /// 一枚个人访问令牌的元信息（0014）。**永远不含明文**——
