@@ -45,7 +45,7 @@ The test for writing one: if someone (including us) looks at a piece of code in 
 | 0019 | [The second clock can be rewound](0019-the-second-clock-can-be-rewound.md) | Implemented in three cuts · `held_at` and `as_of` on every graph read (#317), entities' own clock by unwinding `entity_merges` (#337), retrieval as of a moment · the control on the graph page is still open (#307), full-text recall is still "now" only |
 | 0020 | [An auditor reads it without us](0020-an-auditor-reads-it-without-us.md) | Implemented · `GET /kbs/{id}/export?format=turtle\|jsonld` streams the base as RDF, `rdf.rs` holds the mapping · SPARQL waits, and the record says why (#308) |
 | 0021 | [A rule reads attributes and concludes a type](0021-a-rule-reads-attributes-and-concludes-a-type.md) | Planned · nothing built · `derived_facts` widens to match `facts`, a derived typing rides the builtin `is_a`, rules authored in `attribute_rules` by a person, validity is the premise intersection (#277) |
-| 0022 | [RSS observations are not documents](0022-rss-observations-are-not-documents.md) | Implemented in #326 · local verification complete; upstream acceptance pending |
+| 0022 | [RSS observations are not documents](0022-rss-observations-are-not-documents.md) | Implemented in #326 |
 
 ## Not a decision record
 

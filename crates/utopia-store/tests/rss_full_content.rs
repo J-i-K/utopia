@@ -30,15 +30,20 @@ async fn failed_requeue_shares_rss_admission_capacity() -> anyhow::Result<()> {
         kb_id: Some(kb),
         ..Default::default()
     };
+    assert_eq!(
+        utopia_store::jobs::requeue_failed(&pool, scope).await?,
+        0,
+        "generic retries must not bypass RSS admission"
+    );
     let (a, b) = tokio::join!(
-        utopia_store::jobs::requeue_failed(&pool, scope),
-        utopia_store::jobs::requeue_failed(&pool, scope)
+        utopia_store::rss_full_content::requeue_failed(&pool, scope),
+        utopia_store::rss_full_content::requeue_failed(&pool, scope)
     );
     let requeued = a? + b?;
     let live: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE payload->>'source_id' = $1 AND status IN ('queued', 'running')")
         .bind(source.to_string()).fetch_one(&pool).await?;
     cleanup(&pool, org).await?;
-    assert_eq!(live, 25, "generic requeue exceeded the RSS admission cap");
+    assert_eq!(live, 25, "RSS requeue exceeded the admission cap");
     assert_eq!(requeued, 10, "requeue result must count only admitted jobs");
     Ok(())
 }
@@ -651,7 +656,7 @@ async fn concurrent_deletion_and_publication_leave_no_live_document() -> anyhow:
             .bind(job)
             .execute(&pool)
             .await?;
-        utopia_store::jobs::requeue_failed(
+        utopia_store::rss_full_content::requeue_failed(
             &pool,
             utopia_store::jobs::RequeueScope {
                 kb_id: Some(kb),

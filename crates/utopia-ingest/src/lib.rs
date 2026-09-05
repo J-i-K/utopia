@@ -51,6 +51,40 @@ mod html_tests {
         assert!(super::parse("page.html", html.as_bytes()).is_err());
     }
     #[test]
+    fn html_long_login_only_body_is_rejected_after_extraction_and_on_fallback() {
+        let raw = format!("<html><body><h1>Sign in to continue</h1><form><input type='email'><input type='password'></form><p>{}</p></body></html>", "Account access requires verification of your identity before proceeding. ".repeat(40));
+        for base in [Some("https://example.com/login"), Some("not a URL")] {
+            assert_eq!(
+                super::html::page_to_markdown(&raw, base),
+                Err(super::html::HtmlError::Interstitial)
+            );
+        }
+    }
+
+    #[test]
+    fn html_substantive_fallback_survives_newsletter_controls() {
+        let body =
+            "Detailed reporting on the community with sources and supporting evidence. ".repeat(30);
+        let raw = format!("<form><input type='email'></form><article><p>{body}</p></article>");
+        assert!(dom_smoothie::Readability::new(raw.as_str(), Some("not a URL"), None).is_err());
+        let markdown = super::html::page_to_markdown(&raw, Some("not a URL")).unwrap();
+        assert!(markdown.contains(body.trim()));
+    }
+
+    #[test]
+    fn html_articles_survive_newsletter_and_login_chrome() {
+        let body = "Reporting on password security with detailed supporting evidence. ".repeat(80);
+        for chrome in [
+            "<aside><form><label>Newsletter</label><input type='email'></form></aside>",
+            "<aside><form><label>Login</label><input type='password'></form></aside>",
+        ] {
+            let raw = format!("<html><body>{chrome}<article><h1>Security reporting</h1><p>{body}</p></article></body></html>");
+            let parsed = super::parse("page.html", raw.as_bytes()).unwrap();
+            assert!(parsed.text.contains(body.trim()));
+        }
+    }
+
+    #[test]
     fn html_page_removes_chrome() {
         let body = "Substantive reporting with detailed evidence. ".repeat(80);
         let html = format!("<html><head><title>Story</title></head><body><nav>Navigation noise</nav><article><h1>Story</h1><p>{body}</p></article><footer>Footer noise</footer></body></html>");
@@ -77,6 +111,8 @@ pub mod ontology_rdf;
 mod parsers;
 
 pub use chunker::{chunk_text, ChunkPiece};
+/// Decode fetched text with the same encoding detection as file ingestion.
+pub use parsers::plain_text as decode_text;
 
 /// 解析产物：纯文本 + 可选结构信息。
 #[derive(Debug)]

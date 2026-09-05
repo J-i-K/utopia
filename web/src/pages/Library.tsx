@@ -986,15 +986,6 @@ function SourceBar({
                             source.rss_full_content_terminal_count,
                           )}
                         </span>
-                        <a
-                          className="text-sky-400 hover:text-sky-300 shrink-0"
-                          href={`/api/v1/kbs/${kbId}/sources/${source.id}/rss-full-content/entries`}
-                          target="_blank"
-                          rel="noreferrer"
-                          title={S.library.rssDiagnostics}
-                        >
-                          {S.library.rssDiagnostics}
-                        </a>
                       </>
                     )}
                   </>
@@ -1379,7 +1370,7 @@ function SourceModal({
   const [icon, setIcon] = useState<string | null>(null);
   const [urls, setUrls] = useState("");
   const [feedUrl, setFeedUrl] = useState("");
-  const [rssContentMode, setRssContentMode] = useState<RssContentMode>("full_new_items");
+  const [rssContentMode, setRssContentMode] = useState<RssContentMode>("feed");
   const [endpoint, setEndpoint] = useState("");
   const [authHeader, setAuthHeader] = useState("");
   const [repo, setRepo] = useState("");

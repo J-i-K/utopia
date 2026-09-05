@@ -1,8 +1,7 @@
-use futures_util::StreamExt;
+use crate::http_fetch::{self, FetchError, Limits, Reach};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::net::IpAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use url::Url;
 use utopia_ingest::html::{self, HtmlError};
 
@@ -24,8 +23,6 @@ pub(crate) enum ContentError {
     NotHtml,
     #[error("article response encoding is unsupported")]
     UnsupportedEncoding,
-    #[error("article redirect is invalid")]
-    InvalidRedirect,
     #[error("article redirect downgraded HTTPS to HTTP")]
     BlockedRedirect,
     #[error("article redirect limit exceeded")]
@@ -57,9 +54,7 @@ impl ContentError {
             Self::TooLarge => "response_too_large",
             Self::NotHtml => "unsupported_content_type",
             Self::UnsupportedEncoding => "unsupported_content_type",
-            Self::InvalidRedirect | Self::BlockedRedirect | Self::RedirectLimit => {
-                "blocked_redirect"
-            }
+            Self::BlockedRedirect | Self::RedirectLimit => "blocked_redirect",
             Self::HttpStatus { retryable: true } => "http_retryable",
             Self::HttpStatus { retryable: false } => "http_denied",
             Self::Conversion(_) => "conversion_failed",
@@ -101,24 +96,6 @@ impl Default for FetchConfig {
             connect_timeout: Duration::from_secs(10),
             read_timeout: Duration::from_secs(15),
             overall_timeout: Duration::from_secs(30),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FetchDeadline(Instant);
-
-impl FetchDeadline {
-    fn new(timeout: Duration) -> Self {
-        Self(Instant::now() + timeout)
-    }
-
-    fn remaining(self) -> Result<Duration, ContentError> {
-        let remaining = self.0.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            Err(ContentError::Timeout)
-        } else {
-            Ok(remaining)
         }
     }
 }
@@ -331,199 +308,61 @@ pub(crate) async fn fetch_article_with_config(
     raw_url: &str,
     config: FetchConfig,
 ) -> Result<FetchedPage, ContentError> {
-    let initial_url = validate_article_url(raw_url)?;
-    let deadline = FetchDeadline::new(config.overall_timeout);
-    tokio::time::timeout(
-        config.overall_timeout,
-        fetch_redirect_chain(initial_url, config, deadline),
+    let fetched = http_fetch::get(
+        raw_url,
+        Reach::Content,
+        Limits {
+            max_bytes: config.max_response_bytes,
+            max_redirects: config.max_redirects,
+            dns_timeout: config.dns_timeout,
+            connect_timeout: config.connect_timeout,
+            read_timeout: Some(config.read_timeout),
+            overall_timeout: config.overall_timeout,
+        },
     )
     .await
-    .map_err(|_| ContentError::Timeout)?
+    .map_err(ContentError::from)?;
+    read_page_response(fetched)
 }
 
-async fn fetch_redirect_chain(
-    mut current_url: Url,
-    config: FetchConfig,
-    deadline: FetchDeadline,
-) -> Result<FetchedPage, ContentError> {
-    for redirect_count in 0..=config.max_redirects {
-        let response = fetch_once(&current_url, config, deadline).await?;
-        if response.status().is_redirection() {
-            if redirect_count == config.max_redirects {
-                return Err(ContentError::RedirectLimit);
-            }
-            let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
-                return Err(ContentError::InvalidRedirect);
-            };
-            let location = location
-                .to_str()
-                .map_err(|_| ContentError::InvalidRedirect)?;
-            let next_url = redirect_target(&current_url, location)?;
-            current_url = next_url;
-            continue;
-        }
-
-        if !response.status().is_success() {
-            return Err(ContentError::HttpStatus {
-                retryable: matches!(response.status().as_u16(), 401 | 403 | 408 | 425 | 429)
-                    || response.status().is_server_error(),
-            });
-        }
-        return read_page_response(response, current_url, config, deadline).await;
-    }
-    Err(ContentError::RedirectLimit)
-}
-
-async fn fetch_once(
-    url: &Url,
-    config: FetchConfig,
-    deadline: FetchDeadline,
-) -> Result<reqwest::Response, ContentError> {
-    let host = url.host_str().ok_or(ContentError::InvalidUrl)?;
-    let addresses = resolve_public_addresses(host, url, config, deadline).await?;
-    let remaining = deadline.remaining()?;
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .no_hickory_dns()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(std::cmp::min(config.connect_timeout, remaining))
-        .read_timeout(std::cmp::min(config.read_timeout, remaining))
-        .timeout(remaining)
-        .no_gzip()
-        .no_brotli()
-        .no_zstd()
-        .user_agent("Utopia RSS content fetcher/1")
-        .resolve_to_addrs(host, &addresses)
-        .build()
-        .map_err(|_| ContentError::Network)?;
-    send_once(&client, url).await
-}
-
-async fn send_once(client: &reqwest::Client, url: &Url) -> Result<reqwest::Response, ContentError> {
-    client
-        .get(url.clone())
-        .header(
-            reqwest::header::ACCEPT,
-            "text/html,application/xhtml+xml,text/markdown",
-        )
-        .header(reqwest::header::ACCEPT_ENCODING, "identity")
-        .send()
-        .await
-        .map_err(|error| {
-            if error.is_timeout() {
-                ContentError::Timeout
-            } else {
-                ContentError::Network
-            }
-        })
-}
-
-async fn resolve_public_addresses(
-    host: &str,
-    url: &Url,
-    config: FetchConfig,
-    deadline: FetchDeadline,
-) -> Result<Vec<std::net::SocketAddr>, ContentError> {
-    deadline.remaining()?;
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return validate_resolved_addresses([std::net::SocketAddr::new(ip, 0)]);
-    }
-
-    let port = url
-        .port_or_known_default()
-        .ok_or(ContentError::InvalidUrl)?;
-    let dns_timeout = std::cmp::min(config.dns_timeout, deadline.remaining()?);
-    let lookup = tokio::time::timeout(dns_timeout, tokio::net::lookup_host((host, port)))
-        .await
-        .map_err(|_| ContentError::Timeout)?
-        .map_err(|_| ContentError::DnsResolution)?;
-    validate_resolved_addresses(lookup)
-}
-
-fn validate_resolved_addresses(
-    addresses: impl IntoIterator<Item = std::net::SocketAddr>,
-) -> Result<Vec<std::net::SocketAddr>, ContentError> {
-    let mut unique = HashSet::new();
-    let mut public = Vec::new();
-    for address in addresses {
-        if !is_public_ip(address.ip()) {
-            return Err(ContentError::BlockedAddress);
-        }
-        if unique.insert(address.ip()) {
-            public.push(std::net::SocketAddr::new(address.ip(), 0));
-        }
-    }
-    if public.is_empty() {
-        return Err(ContentError::DnsResolution);
-    }
-    Ok(public)
-}
-
-async fn read_page_response(
-    response: reqwest::Response,
-    final_url: Url,
-    config: FetchConfig,
-    deadline: FetchDeadline,
-) -> Result<FetchedPage, ContentError> {
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .map(str::trim)
-        .map(str::to_ascii_lowercase);
-    let Some(content_type) = content_type else {
-        return Err(ContentError::NotHtml);
-    };
+fn read_page_response(page: http_fetch::Fetched) -> Result<FetchedPage, ContentError> {
     if !matches!(
-        content_type.as_str(),
+        page.mime.as_str(),
         "text/html" | "application/xhtml+xml" | "text/markdown"
     ) {
         return Err(ContentError::NotHtml);
     }
-
-    if response
-        .headers()
-        .get(reqwest::header::CONTENT_ENCODING)
-        .is_some_and(|value| {
-            value
-                .to_str()
-                .map(|value| !value.trim().is_empty() && !value.eq_ignore_ascii_case("identity"))
-                .unwrap_or(true)
-        })
-    {
+    if page.content_encoding.as_ref().is_some_and(|value| {
+        value
+            .to_str()
+            .map(|value| !value.trim().is_empty() && !value.eq_ignore_ascii_case("identity"))
+            .unwrap_or(true)
+    }) {
         return Err(ContentError::UnsupportedEncoding);
     }
-
-    if response
-        .content_length()
-        .is_some_and(|length| length > config.max_response_bytes as u64)
-    {
-        return Err(ContentError::TooLarge);
-    }
-
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    loop {
-        let chunk = tokio::time::timeout(deadline.remaining()?, stream.next())
-            .await
-            .map_err(|_| ContentError::Timeout)?;
-        let Some(chunk) = chunk else {
-            break;
-        };
-        let chunk = chunk.map_err(|_| ContentError::Network)?;
-        if body.len().saturating_add(chunk.len()) > config.max_response_bytes {
-            return Err(ContentError::TooLarge);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    let body =
-        String::from_utf8(body).map_err(|_| ContentError::Conversion("invalid UTF-8".into()))?;
     Ok(FetchedPage {
-        final_url,
-        content_type,
-        body,
+        final_url: page.final_url,
+        content_type: page.mime,
+        body: utopia_ingest::decode_text(&page.bytes),
     })
+}
+
+impl From<FetchError> for ContentError {
+    fn from(error: FetchError) -> Self {
+        match error {
+            FetchError::InvalidUrl(_) | FetchError::UnsupportedScheme(_) => Self::InvalidUrl,
+            FetchError::BlockedAddress(_) => Self::BlockedAddress,
+            FetchError::Dns(_) => Self::DnsResolution,
+            FetchError::BlockedRedirect(_) => Self::BlockedRedirect,
+            FetchError::RedirectLimit => Self::RedirectLimit,
+            FetchError::TooLarge(_) => Self::TooLarge,
+            FetchError::Status(status) => Self::HttpStatus {
+                retryable: matches!(status, 401 | 403 | 408 | 425 | 429 | 500..=599),
+            },
+            FetchError::Transport(error) if error.is_timeout() => Self::Timeout,
+            FetchError::Transport(_) => Self::Network,
+        }
+    }
 }
 
 impl From<HtmlError> for ContentError {
@@ -551,70 +390,6 @@ pub(crate) fn normalize_markdown(markdown: &str) -> Result<String, ContentError>
     Ok(markdown)
 }
 
-fn looks_like_challenge_shell(lowered: &str) -> bool {
-    const HIGH_CONFIDENCE_MARKERS: &[&str] = &[
-        "verify you are human",
-        "checking your browser",
-        "enable javascript and cookies",
-        "accept cookies to continue",
-        "subscribe to continue",
-        "subscribe to read",
-        "sign in to continue",
-        "log in to continue",
-        "this content is behind a paywall",
-        "content is behind a paywall",
-        "unlock this article",
-        "captcha challenge",
-        "complete the captcha",
-        "solve the captcha",
-        "enter the captcha",
-        "captcha verification",
-    ];
-    if HIGH_CONFIDENCE_MARKERS
-        .iter()
-        .any(|marker| lowered.contains(marker))
-        || lowered
-            .lines()
-            .take(3)
-            .any(|line| line.trim().trim_start_matches('#').trim() == "access denied")
-    {
-        return true;
-    }
-
-    // Readability can retain a long login/consent shell without any of the
-    // exact phrases above. Require two short, control-like lines so ordinary
-    // articles that mention one of these topics are not rejected.
-    const STRUCTURAL_MARKERS: &[&str] = &[
-        "sign in",
-        "log in",
-        "login",
-        "create account",
-        "register",
-        "cookie settings",
-        "consent preferences",
-        "accept all cookies",
-        "enable javascript",
-        "access denied",
-        "play video",
-        "watch now",
-    ];
-    let structural_hits = lowered
-        .lines()
-        .take(40)
-        .filter(|line| {
-            let line = line.trim().trim_start_matches('#').trim();
-            line.len() <= 96
-                && STRUCTURAL_MARKERS
-                    .iter()
-                    .any(|marker| line.contains(marker))
-        })
-        .count();
-    let has_auth_fields = (lowered.contains("password")
-        && (lowered.contains("email") || lowered.contains("username")))
-        || lowered.contains("<form");
-    structural_hits >= 2 || (structural_hits >= 1 && has_auth_fields)
-}
-
 pub(crate) fn quality_check(
     markdown: &str,
     summary: &str,
@@ -624,7 +399,7 @@ pub(crate) fn quality_check(
         return Err(ContentError::NonSubstantive);
     }
     let lowered = markdown.to_ascii_lowercase();
-    if looks_like_challenge_shell(&lowered) {
+    if html::looks_like_challenge_shell(&lowered) {
         return Err(ContentError::ChallengePage);
     }
     let link_count = markdown.matches("](").count();
@@ -639,7 +414,28 @@ pub(crate) fn quality_check(
 
 fn is_substantive(markdown: &str, summary: &str, linked_page: bool) -> bool {
     let non_whitespace = markdown.chars().filter(|ch| !ch.is_whitespace()).count();
-    let words = markdown.split_whitespace().count();
+    // CJK prose has no word separators. Count each ideograph/syllable as a
+    // lexical unit without lowering the English thresholds. A repeated handful
+    // of navigation labels is not evidence of an article.
+    let is_cjk = |ch: char| {
+        matches!(ch as u32,
+        0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff |
+        0x20000..=0x323af | 0x3040..=0x30ff | 0xac00..=0xd7af)
+    };
+    let cjk_count = markdown.chars().filter(|ch| is_cjk(*ch)).count();
+    let cjk_unique = markdown
+        .chars()
+        .filter(|ch| is_cjk(*ch))
+        .collect::<HashSet<_>>()
+        .len();
+    if cjk_count >= 80 && cjk_unique < 20 {
+        return false;
+    }
+    let words = cjk_count
+        + markdown
+            .split(is_cjk)
+            .flat_map(str::split_whitespace)
+            .count();
     let (min_words, min_chars) = if linked_page { (200, 1_200) } else { (80, 500) };
     if words < min_words && non_whitespace < min_chars {
         return false;
@@ -661,109 +457,12 @@ fn is_substantive(markdown: &str, summary: &str, linked_page: bool) -> bool {
             && body.len().saturating_sub(summary.len()) < if linked_page { 300 } else { 160 })
 }
 
-pub(crate) fn validate_article_url(raw: &str) -> Result<Url, ContentError> {
-    let parsed = Url::parse(raw).map_err(|_| ContentError::InvalidUrl)?;
-    if !matches!(parsed.scheme(), "http" | "https")
-        || parsed.host_str().is_none()
-        || parsed.fragment().is_some()
-        || parsed.port().is_some_and(|port| !matches!(port, 80 | 443))
-        || parsed.username() != ""
-        || parsed.password().is_some()
-        || raw_authority_contains_userinfo(raw)
-    {
-        return Err(ContentError::InvalidUrl);
-    }
-    if let Some(ip) = parsed.host().and_then(|host| match host {
-        url::Host::Ipv4(ip) => Some(IpAddr::V4(ip)),
-        url::Host::Ipv6(ip) => Some(IpAddr::V6(ip)),
-        url::Host::Domain(_) => None,
-    }) {
-        if !is_public_ip(ip) {
-            return Err(ContentError::BlockedAddress);
-        }
-    }
-    Ok(parsed)
-}
-
-fn raw_authority_contains_userinfo(raw: &str) -> bool {
-    let Some(authority) = raw
-        .split_once("://")
-        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(rest))
-    else {
-        return false;
-    };
-    authority.contains('@')
-}
-
-fn redirect_target(current_url: &Url, location: &str) -> Result<Url, ContentError> {
-    let next_url = current_url
-        .join(location)
-        .map_err(|_| ContentError::InvalidRedirect)?;
-    if current_url.scheme() == "https" && next_url.scheme() == "http" {
-        return Err(ContentError::BlockedRedirect);
-    }
-    validate_article_url(next_url.as_str())
-}
-
-fn is_public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            let [a, b, c, d] = ip.octets();
-            !(a == 0
-                || a == 10
-                || a == 127
-                || (a == 100 && (64..=127).contains(&b))
-                || (a == 169 && b == 254)
-                || (a == 172 && (16..=31).contains(&b))
-                || (a == 192 && b == 0)
-                || (a == 192 && b == 0 && c == 2)
-                || (a == 192 && b == 88 && c == 99)
-                || (a == 192 && b == 168)
-                || (a == 198 && (b == 18 || b == 19))
-                || (a == 198 && b == 51 && c == 100)
-                || (a == 203 && b == 0 && c == 113)
-                || a >= 224
-                || (a == 255 && b == 255 && c == 255 && d == 255))
-        }
-        IpAddr::V6(ip) => {
-            let segments = ip.segments();
-            let first = segments[0];
-            let is_v4_mapped = segments[..5] == [0, 0, 0, 0, 0] && segments[5] == 0xffff;
-            let mapped_v4 = u32::from(segments[6]) << 16 | u32::from(segments[7]);
-            let is_nat64 = segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0];
-            let is_private_nat64 = segments[..3] == [0x0064, 0xff9b, 1];
-            let is_6to4 = first == 0x2002;
-            let embedded_v4 = if is_v4_mapped || is_nat64 {
-                Some(mapped_v4)
-            } else if is_6to4 {
-                Some(u32::from(segments[1]) << 16 | u32::from(segments[2]))
-            } else {
-                None
-            };
-            !(ip.is_loopback()
-                || ip.is_unspecified()
-                || (first & 0xff00) == 0xff00
-                || (first & 0xfe00) == 0xfc00
-                || (first & 0xffc0) == 0xfe80
-                || is_private_nat64
-                || (first == 0x2001 && segments[1] == 0x0db8)
-                || (first == 0x2001 && segments[1] == 0x0000)
-                || (first == 0x2001 && (segments[1] & 0xfff0) == 0x0010)
-                || (first == 0x2001 && segments[1] == 0x0002)
-                || (first == 0x3fff && (segments[1] & 0xf000) == 0))
-                && embedded_v4
-                    .is_none_or(|v4| is_public_ip(IpAddr::V4(std::net::Ipv4Addr::from(v4))))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
-    use std::net::SocketAddr;
     use uuid::Uuid;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -788,6 +487,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn linked_response_decodes_gbk_and_utf8_like_uploads() {
+        let expected = "中文新闻报道：记者调查城市交通建设，居民关注公共服务。";
+        let gbk = vec![
+            214, 208, 206, 196, 208, 194, 206, 197, 177, 168, 181, 192, 163, 186, 188, 199, 213,
+            223, 181, 247, 178, 233, 179, 199, 202, 208, 189, 187, 205, 168, 189, 168, 201, 232,
+            163, 172, 190, 211, 195, 241, 185, 216, 215, 162, 185, 171, 185, 178, 183, 254, 206,
+            241, 161, 163,
+        ];
+        for bytes in [gbk, expected.as_bytes().to_vec()] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(bytes.clone(), "text/html"))
+                .mount(&server)
+                .await;
+            let fetched = http_fetch::get(&server.uri(), Reach::Operator, Limits::default())
+                .await
+                .unwrap();
+            let page = read_page_response(fetched).unwrap();
+            assert_eq!(page.body, expected);
+            assert_eq!(
+                utopia_ingest::parse("text.txt", &bytes)
+                    .unwrap()
+                    .text
+                    .trim(),
+                page.body
+            );
+        }
+    }
+
     #[test]
     fn direct_markdown_uses_shared_normalization() {
         let raw = "  # Story\n\n\n\n[bad](%6Aavascript:evil) [safe](https://example.com)  ";
@@ -800,13 +529,12 @@ mod tests {
     }
 
     #[test]
-    fn html_interstitial_cannot_be_lost_by_readability() {
+    fn article_with_login_chrome_is_not_an_interstitial() {
         let body = "Detailed reporting with plenty of supporting evidence. ".repeat(80);
         let html = format!("<form><input type='password'></form><article><p>{body}</p></article>");
-        assert_eq!(
-            extract_article_markdown(&html, "https://example.com/story"),
-            Err(ContentError::ChallengePage)
-        );
+        let markdown = extract_article_markdown(&html, "https://example.com/story").unwrap();
+        assert!(markdown.contains(body.trim()));
+        assert_eq!(quality_check(&markdown, "", true), Ok(()));
     }
 
     #[test]
@@ -815,6 +543,120 @@ mod tests {
         let markdown = normalize_feed_html(html).expect("normalization should succeed");
         assert!(markdown.contains("# Article title"));
         assert!(markdown.contains("Article body."));
+    }
+
+    #[test]
+    fn shared_response_adapter_keeps_rss_mime_encoding_and_retry_policy() {
+        for mime in [
+            "text/html",
+            "application/xhtml+xml",
+            "text/markdown",
+            "text/plain",
+            "application/octet-stream",
+        ] {
+            for encoding in [None, Some("identity"), Some("gzip"), Some("br")] {
+                let result = read_page_response(http_fetch::Fetched {
+                    final_url: Url::parse("https://example.com/final").unwrap(),
+                    mime: mime.into(),
+                    bytes: b"body".to_vec(),
+                    content_encoding: encoding.map(reqwest::header::HeaderValue::from_static),
+                });
+                if matches!(mime, "text/plain" | "application/octet-stream") {
+                    assert!(matches!(result, Err(ContentError::NotHtml)));
+                } else if matches!(encoding, Some("gzip" | "br")) {
+                    assert!(matches!(result, Err(ContentError::UnsupportedEncoding)));
+                } else {
+                    assert_eq!(
+                        result.unwrap().final_url.as_str(),
+                        "https://example.com/final"
+                    );
+                }
+            }
+        }
+        for status in [401, 403, 408, 425, 429, 500, 503] {
+            assert!(ContentError::from(FetchError::Status(status)).is_retryable());
+        }
+        assert!(!ContentError::from(FetchError::Status(404)).is_retryable());
+        assert_eq!(
+            ContentError::from(FetchError::TooLarge(8)).code(),
+            "response_too_large"
+        );
+    }
+
+    // Opt-in network acceptance, not an offline CI fixture. Endpoint contracts:
+    // https://httpbingo.org/ documents /redirect-to and /html. Availability,
+    // public DNS, TLS and the service's example body are external dependencies.
+    // Run: cargo test -p utopia-server live_content_reach_rss -- --ignored --nocapture
+    // No resolver override, proxy, private-address exception or alternate caller.
+    #[tokio::test]
+    #[ignore = "live public HTTPS acceptance; requires network and httpbingo.org"]
+    async fn live_content_reach_rss() {
+        let url = "https://httpbingo.org/redirect-to?url=%2Fhtml";
+        let page = fetch_article_with_config(url, FetchConfig::default())
+            .await
+            .expect("Content reach must resolve/pin both public HTTPS hops and adapt HTML");
+        assert_eq!(page.final_url.as_str(), "https://httpbingo.org/html");
+        assert_eq!(page.content_type, "text/html");
+        assert!(page.body.contains("Herman Melville - Moby-Dick"));
+        let markdown = extract_article_markdown(&page.body, page.final_url.as_str()).unwrap();
+        assert!(markdown.contains("portable forge"));
+        assert_eq!(quality_check(&markdown, "", true), Ok(()));
+        eprintln!(
+            "Content reach accepted {}: {} bytes, extracted {} bytes",
+            page.final_url,
+            page.body.len(),
+            markdown.len()
+        );
+
+        let too_small = FetchConfig {
+            max_response_bytes: 32,
+            ..FetchConfig::default()
+        };
+        assert!(matches!(
+            fetch_article_with_config(url, too_small).await,
+            Err(ContentError::TooLarge)
+        ));
+        let no_redirect = FetchConfig {
+            max_redirects: 0,
+            ..FetchConfig::default()
+        };
+        assert!(matches!(
+            fetch_article_with_config(url, no_redirect).await,
+            Err(ContentError::RedirectLimit)
+        ));
+    }
+
+    #[tokio::test]
+    async fn rss_fetch_cannot_reach_loopback() {
+        assert!(matches!(
+            fetch_article("http://127.0.0.1/article").await,
+            Err(ContentError::BlockedAddress)
+        ));
+        let defaults = FetchConfig::default();
+        assert_eq!(defaults.max_response_bytes, 8 * 1024 * 1024);
+        assert_eq!(defaults.max_redirects, 5);
+        assert_eq!(defaults.dns_timeout, Duration::from_secs(5));
+        assert_eq!(defaults.connect_timeout, Duration::from_secs(10));
+        assert_eq!(defaults.read_timeout, Duration::from_secs(15));
+        assert_eq!(defaults.overall_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn rss_uses_shared_public_address_policy() {
+        assert!(http_fetch::validate_content_url("https://192.0.1.1/article").is_ok());
+        let source = include_str!("rss_full_content.rs");
+        assert!(source.contains("http_fetch::get("));
+        for duplicate in [
+            "fetch_once",
+            "resolve_public_addresses",
+            "redirect_target",
+            "is_public_ip",
+        ] {
+            assert!(
+                !source.contains(&format!("fn {duplicate}(")),
+                "duplicate guard {duplicate}"
+            );
+        }
     }
 
     #[test]
@@ -830,11 +672,11 @@ mod tests {
             "http://[::1]/article",
         ] {
             assert!(
-                validate_article_url(raw).is_err(),
+                http_fetch::validate_content_url(raw).is_err(),
                 "unsafe URL was accepted: {raw}"
             );
         }
-        assert!(validate_article_url("https://example.com/article").is_ok());
+        assert!(http_fetch::validate_content_url("https://example.com/article").is_ok());
     }
 
     #[test]
@@ -889,23 +731,31 @@ mod tests {
             "http://[2002:c0a8:0101::]/article",
         ] {
             assert!(
-                validate_article_url(raw).is_err(),
+                http_fetch::validate_content_url(raw).is_err(),
                 "special address was accepted: {raw}"
             );
         }
-        assert!(validate_article_url("http://[2001:4860:4860::8888]/article").is_ok());
+        assert!(http_fetch::validate_content_url("http://[2001:4860:4860::8888]/article").is_ok());
     }
 
     #[test]
-    fn mixed_dns_answers_fail_closed_even_when_one_address_is_public() {
-        let addresses = vec![
-            "93.184.216.34:0".parse().unwrap(),
-            "192.168.1.10:0".parse().unwrap(),
-        ];
-        assert!(matches!(
-            validate_resolved_addresses(addresses),
-            Err(ContentError::BlockedAddress)
-        ));
+    fn cjk_news_is_substantive_without_whitespace() {
+        let reporting = "记者走访城市公共交通建设现场，发现新的线路连接学校医院和居民社区。工程团队介绍施工进展，并公布环境监测数据。当地居民讨论出行需求，专家分析财政预算与长期维护成本。有关部门表示将继续收集意见，调整服务时间，保障不同地区乘客的基本需求。";
+        let body: String = reporting.chars().cycle().take(600).collect();
+        assert_eq!(body.chars().count(), 600);
+        assert_eq!(quality_check(&body, "简短摘要", true), Ok(()));
+        assert_eq!(quality_check(&body, "简短摘要", false), Ok(()));
+        assert_eq!(
+            quality_check(&body, &body, true),
+            Err(ContentError::NonSubstantive)
+        );
+        assert_eq!(
+            quality_check("记者报道城市交通建设", "", true),
+            Err(ContentError::NonSubstantive)
+        );
+        assert!(quality_check(&"登录注册订阅".repeat(120), "", true).is_err());
+        assert!(quality_check(&"short ".repeat(100), "", true).is_err());
+        assert_eq!(quality_check(&"word ".repeat(200), "", true), Ok(()));
     }
 
     #[test]
@@ -933,122 +783,6 @@ mod tests {
         assert!(!ContentError::NonSubstantive.is_retryable());
         assert!(ContentError::Timeout.is_retryable());
         assert!(ContentError::HttpStatus { retryable: true }.is_retryable());
-    }
-
-    #[test]
-    fn redirect_policy_rejects_https_downgrade_and_special_targets() {
-        let https = Url::parse("https://example.com/article").unwrap();
-        assert_eq!(
-            redirect_target(&https, "http://example.com/final"),
-            Err(ContentError::BlockedRedirect)
-        );
-        assert_eq!(
-            redirect_target(&https, "https://127.0.0.1/admin"),
-            Err(ContentError::BlockedAddress)
-        );
-        assert_eq!(
-            redirect_target(&https, "/final").unwrap(),
-            Url::parse("https://example.com/final").unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn guarded_send_does_not_follow_redirects_and_sends_identity_encoding() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/redirect"))
-            .and(header("accept-encoding", "identity"))
-            .respond_with(
-                ResponseTemplate::new(302)
-                    .insert_header("location", "/final")
-                    .insert_header("content-type", "text/html"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/final"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("should not be fetched"))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let port = server.address().port();
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve("example.com", SocketAddr::new(server.address().ip(), port))
-            .build()
-            .expect("test client should build");
-        let url = Url::parse(&format!("http://example.com:{port}/redirect"))
-            .expect("test URL should parse");
-        let response = send_once(&client, &url)
-            .await
-            .expect("request should succeed");
-        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
-        assert_eq!(
-            response.headers().get(reqwest::header::LOCATION),
-            Some(&reqwest::header::HeaderValue::from_static("/final"))
-        );
-    }
-
-    #[tokio::test]
-    async fn guarded_response_reader_enforces_html_and_byte_limits() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/text"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "text/plain")
-                    .set_body_string("not html"),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/large"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw("0123456789", "text/html"))
-            .mount(&server)
-            .await;
-
-        let port = server.address().port();
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .resolve("example.com", SocketAddr::new(server.address().ip(), port))
-            .build()
-            .expect("test client should build");
-        let config = FetchConfig {
-            max_response_bytes: 8,
-            ..FetchConfig::default()
-        };
-        let text_url =
-            Url::parse(&format!("http://example.com:{port}/text")).expect("test URL should parse");
-        let text_response = send_once(&client, &text_url)
-            .await
-            .expect("request should succeed");
-        assert!(matches!(
-            read_page_response(
-                text_response,
-                text_url,
-                config,
-                FetchDeadline::new(Duration::from_secs(5)),
-            )
-            .await,
-            Err(ContentError::NotHtml)
-        ));
-
-        let large_url =
-            Url::parse(&format!("http://example.com:{port}/large")).expect("test URL should parse");
-        let large_response = send_once(&client, &large_url)
-            .await
-            .expect("request should succeed");
-        let result = read_page_response(
-            large_response,
-            large_url,
-            config,
-            FetchDeadline::new(Duration::from_secs(5)),
-        )
-        .await;
-        assert!(matches!(result, Err(ContentError::TooLarge)));
     }
 
     #[tokio::test]
@@ -1096,8 +830,8 @@ mod tests {
     #[test]
     fn private_nat64_prefix_is_blocked() {
         assert!(matches!(
-            validate_article_url("http://[64:ff9b:1::1]/article"),
-            Err(ContentError::BlockedAddress)
+            http_fetch::validate_content_url("http://[64:ff9b:1::1]/article"),
+            Err(FetchError::BlockedAddress(_))
         ));
     }
 

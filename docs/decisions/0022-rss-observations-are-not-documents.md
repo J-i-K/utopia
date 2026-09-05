@@ -1,12 +1,14 @@
 # 0022 · RSS observations are not documents
 
-- **Status**: implemented in PR #326; local verification complete, upstream acceptance pending
+- **Status**: Implemented in #326
 - **Written**: 2026-09-05
 - **Discussion**: [maintainer feedback on #326](https://github.com/deeplethe/utopia/pull/326#issuecomment-5547020427). This record follows implementation; it does not claim the issue/record-before-code sequence in `CONTRIBUTING.md` was followed.
 
 ## Why retain an observation
 
 A feed can drop an item before a queued acquisition runs. Documents cannot retain an item that has not produced acceptable content, and creating a document from its summary would misrepresent full-content ingestion. The first successful feed response also needs durable identities so enabling full-content mode does not backfill existing items. An empty successful response establishes that baseline too; a failed response does not.
+
+Entries without a publisher-provided GUID/Atom ID and without a usable HTTP(S) article link are silently skipped in both feed-content and full-content modes. Titles are not an identity fallback. The shared ingestion filter drops these entries before either mode processes them, so they create neither documents nor observation/diagnostic rows.
 
 ## Decisions
 
@@ -20,4 +22,4 @@ Use one Readability/Markdown page extractor for generic HTML and linked RSS page
 
 ## Verification and limits
 
-Required-database tests cover migration replay, purge/reappearance, concurrent publication/deletion and retry capacity. HTTP-backed tests cover a 201-item baseline, empty/failed feeds, stale responses and feed-native hydration through processing-job creation. This does not establish deployment readiness or downstream model-processing completion. Diagnostic rows and counts share a projection; raw job errors and feed bodies are not exposed by the RSS diagnostic endpoint.
+Required-database tests cover migration replay, purge/reappearance, concurrent publication/deletion and retry capacity. HTTP-backed tests cover a 201-item baseline, empty/failed feeds, stale responses and feed-native hydration through processing-job creation. This does not establish deployment readiness or downstream model-processing completion. Internal entry state and source counts share a projection; per-entry troubleshooting data is not exposed through a public RSS endpoint.

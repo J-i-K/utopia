@@ -597,7 +597,6 @@ export const en = {
     rssContentModeHint: "Full mode fetches linked articles only for items first seen after activation.",
     rssFullModeHint:
       "The first successful sync records the current feed as a baseline and imports nothing. Later new items use feed content first, then a guarded article fetch; summaries without usable content remain diagnosable terminal outcomes.",
-    rssDiagnostics: "Entry diagnostics",
     rssFeedModeHint:
       "Legacy mode stores feed content or the summary and does not fetch linked articles.",
     rssHydrationCounts: (pending: number, queued: number, retrying: number, complete: number, terminal: number) =>
