@@ -805,6 +805,12 @@ export const zh: Strings = {
       modelDefault: "默认",
       modelReset: "重置",
       modelResetHint: "去掉这个模型自己的上限，回落到默认值。",
+      codexAuth: "ChatGPT 订阅认证",
+      codexAuthHint:
+        "Utopia 在这里完成订阅登录，并把凭据保存在部署自己的私有数据目录中。已经认证的 CODEX_HOME 仅作为可选的外部回退。",
+      codexAuthStatus: (status: string) => `状态：${status}`,
+      codexAuthCommand: "请点击上面的 Utopia 内部登录按钮。",
+      codexAuthRequired: "尚未认证——不能选择订阅模式。",
     },
     datasources: {
       tab: "数据源",

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use utopia_core::config::{AppConfig, BackgroundLlmProvider};
+use utopia_core::config::{AppConfig, BackgroundLlmProvider, CodexAuthSource};
 use utopia_core::models::{ChatAccessMode, LlmSettings};
 use utopia_llm::{BackgroundTextClient, ChatMessage, LlmClient};
 
@@ -38,6 +38,15 @@ pub fn embed_client(s: &LlmSettings) -> Option<LlmClient> {
 pub struct BackgroundRuntime {
     codex_client: Option<Arc<utopia_llm::CodexResponsesClient>>,
     codex_gate: Option<Arc<Semaphore>>,
+    auth_flow: Arc<std::sync::Mutex<Option<AuthFlow>>>,
+}
+
+#[derive(Clone)]
+struct AuthFlow {
+    status: &'static str,
+    user_code: Option<String>,
+    verification_url: Option<String>,
+    task: Option<tokio::task::AbortHandle>,
 }
 
 impl BackgroundRuntime {
@@ -47,28 +56,164 @@ impl BackgroundRuntime {
             BackgroundLlmProvider::ChatCompletions => Ok(Self {
                 codex_client: None,
                 codex_gate: None,
+                auth_flow: Arc::new(std::sync::Mutex::new(None)),
             }),
             BackgroundLlmProvider::CodexResponses => {
-                let home = cfg
-                    .codex_home
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("Codex credential home is missing"))?;
+                let home = match cfg.codex_auth_source {
+                    CodexAuthSource::Internal => {
+                        let data_dir = std::path::PathBuf::from(&cfg.data_dir);
+                        let data_dir = if data_dir.is_absolute() {
+                            data_dir
+                        } else {
+                            std::env::current_dir()?.join(data_dir)
+                        };
+                        let home = data_dir.join("codex-auth");
+                        std::fs::create_dir_all(&home)?;
+                        #[cfg(unix)]
+                        std::fs::set_permissions(
+                            &home,
+                            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                        )?;
+                        home
+                    }
+                    CodexAuthSource::Preauthenticated => cfg
+                        .codex_home
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("Codex credential home is missing"))?
+                        .into(),
+                };
+                let auth = Arc::new(match cfg.codex_auth_source {
+                    CodexAuthSource::Internal => utopia_llm::CodexAuthManager::new_for_auth(&home)?,
+                    CodexAuthSource::Preauthenticated => utopia_llm::CodexAuthManager::new(&home)?,
+                });
                 let model = cfg
                     .codex_model
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("Codex model is missing"))?;
-                let auth = Arc::new(utopia_llm::CodexAuthManager::new(home)?);
                 let client = Arc::new(utopia_llm::CodexResponsesClient::new(auth, model)?);
                 Ok(Self {
                     codex_client: Some(client),
                     codex_gate: Some(Arc::new(Semaphore::new(cfg.codex_max_concurrency as usize))),
+                    auth_flow: Arc::new(std::sync::Mutex::new(None)),
                 })
             }
         }
     }
 
+    pub fn subscription_auth_status(&self) -> Option<utopia_llm::CodexAuthStatus> {
+        self.codex_client
+            .as_ref()
+            .map(|client| client.auth_status())
+    }
+
     pub fn subscription_available(&self) -> bool {
         self.codex_client.is_some()
+    }
+
+    pub fn subscription_auth_flow_status(&self) -> Option<serde_json::Value> {
+        let flow = self.auth_flow.lock().ok()?.as_ref()?.clone();
+        Some(serde_json::json!({
+            "status": flow.status,
+            "user_code": flow.user_code,
+            "verification_url": flow.verification_url,
+        }))
+    }
+
+    pub async fn start_subscription_auth(&self) -> anyhow::Result<serde_json::Value> {
+        let client = self
+            .codex_client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Codex subscription is unavailable"))?
+            .clone();
+        {
+            let mut flow = self
+                .auth_flow
+                .lock()
+                .map_err(|_| anyhow::anyhow!("authentication state unavailable"))?;
+            if flow.as_ref().is_some_and(|f| f.status == "pending") {
+                anyhow::bail!("Codex authentication is already in progress");
+            }
+            *flow = Some(AuthFlow {
+                status: "starting",
+                user_code: None,
+                verification_url: None,
+                task: None,
+            });
+        }
+        let session = match client.begin_device_auth().await {
+            Ok(session) => session,
+            Err(error) => {
+                if let Ok(mut flow) = self.auth_flow.lock() {
+                    *flow = Some(AuthFlow {
+                        status: "failed",
+                        user_code: None,
+                        verification_url: None,
+                        task: None,
+                    });
+                }
+                return Err(anyhow::Error::new(error));
+            }
+        };
+        let result = serde_json::json!({ "status": "pending", "user_code": session.user_code, "verification_url": session.verification_url });
+        {
+            let mut flow = self
+                .auth_flow
+                .lock()
+                .map_err(|_| anyhow::anyhow!("authentication state unavailable"))?;
+            *flow = Some(AuthFlow {
+                status: "pending",
+                user_code: Some(session.user_code.clone()),
+                verification_url: Some(session.verification_url.clone()),
+                task: None,
+            });
+        }
+        let state = Arc::clone(&self.auth_flow);
+        let handle = tokio::spawn(async move {
+            let status = match client.complete_device_auth(&session).await {
+                Ok(()) => "authenticated",
+                Err(_) => "failed",
+            };
+            if let Ok(mut flow) = state.lock() {
+                if flow.as_ref().is_some_and(|f| f.status == "cancelled") {
+                    return;
+                }
+                *flow = Some(AuthFlow {
+                    status,
+                    user_code: None,
+                    verification_url: None,
+                    task: None,
+                });
+            }
+        });
+        if let Ok(mut flow) = self.auth_flow.lock() {
+            if let Some(flow) = flow.as_mut() {
+                flow.task = Some(handle.abort_handle());
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn cancel_subscription_auth(&self) -> bool {
+        let Ok(mut flow) = self.auth_flow.lock() else {
+            return false;
+        };
+        if flow
+            .as_ref()
+            .is_some_and(|f| f.status == "pending" || f.status == "starting")
+        {
+            if let Some(task) = flow.as_ref().and_then(|f| f.task.as_ref()) {
+                task.abort();
+            }
+            *flow = Some(AuthFlow {
+                status: "cancelled",
+                user_code: None,
+                verification_url: None,
+                task: None,
+            });
+            true
+        } else {
+            false
+        }
     }
 
     pub fn ready(&self, settings: Option<&LlmSettings>) -> bool {

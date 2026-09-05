@@ -232,6 +232,7 @@ export interface LlmSettingsView {
   chat_model?: string | null;
   chat_access_mode?: ChatAccessMode;
   subscription_available?: boolean;
+  subscription_authenticated?: boolean;
   has_chat_key?: boolean;
   embed_base_url?: string | null;
   embed_model?: string | null;
@@ -1141,6 +1142,8 @@ export const api = {
       /** 外层兜底，防任务无限堆积；真正的节流是按模型的限额 */
       worker_concurrency: number;
       default_model_concurrency: number;
+      subscription_auth_status: "authenticated" | "unauthenticated" | "invalid" | "unavailable";
+      subscription_auth_flow: { status: string; user_code?: string; verification_url?: string };
       /** 新建知识库的本体语言默认值。**不是界面语言**——那个在客户端 */
       default_ontology_lang: "en" | "zh";
       model_limits: {
@@ -1150,6 +1153,12 @@ export const api = {
       }[];
       models_in_use: { base_url: string; model: string; kind: string }[];
     }>("/api/v1/admin/deployment"),
+  startAdminCodexAuth: () =>
+    request<{ status: string; user_code: string; verification_url: string }>("/api/v1/admin/deployment/codex-auth/start", { method: "POST" }),
+  adminCodexAuthStatus: () =>
+    request<{ status: string; user_code?: string; verification_url?: string }>("/api/v1/admin/deployment/codex-auth/status"),
+  cancelAdminCodexAuth: () =>
+    request<{ ok: boolean }>("/api/v1/admin/deployment/codex-auth/cancel", { method: "POST" }),
   saveAdminDeployment: (
     openRegistration: boolean,
     workerConcurrency?: number,

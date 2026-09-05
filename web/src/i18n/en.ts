@@ -885,6 +885,12 @@ export const en = {
       modelReset: "Reset",
       modelResetHint:
         "Drop this model's own limit and fall back to the default.",
+      codexAuth: "ChatGPT subscription authentication",
+      codexAuthHint:
+        "Utopia handles subscription sign-in here and stores credentials in its private deployment data. A preauthenticated CODEX_HOME is an optional external fallback only.",
+      codexAuthStatus: (status: string) => `Status: ${status}`,
+      codexAuthCommand: "Start the internal Utopia sign-in above.",
+      codexAuthRequired: "Not authenticated — subscription mode cannot be selected.",
     },
     datasources: {
       tab: "Data sources",

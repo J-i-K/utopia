@@ -55,6 +55,10 @@ pub async fn get(
     Ok(Json(match s {
         None => json!({
             "subscription_available": state.background.subscription_available(),
+            "subscription_authenticated": matches!(
+                state.background.subscription_auth_status(),
+                Some(utopia_llm::CodexAuthStatus::Authenticated)
+            ),
         }),
         Some(s) => json!({
             "chat_base_url": s.chat_base_url,
@@ -66,6 +70,10 @@ pub async fn get(
             "embed_dim": s.embed_dim,
             "has_embed_key": s.embed_api_key.as_deref().is_some_and(|k| !k.is_empty()),
             "subscription_available": state.background.subscription_available(),
+            "subscription_authenticated": matches!(
+                state.background.subscription_auth_status(),
+                Some(utopia_llm::CodexAuthStatus::Authenticated)
+            ),
         }),
     }))
 }
@@ -115,10 +123,13 @@ pub async fn put(
         &nonempty,
     );
     if access_mode == ChatAccessMode::Subscription {
-        if !state.background.subscription_available() {
+        if !matches!(
+            state.background.subscription_auth_status(),
+            Some(utopia_llm::CodexAuthStatus::Authenticated)
+        ) {
             return Err(AppError::invalid(
-                "subscription_unavailable",
-                "ChatGPT subscription access is not enabled for this deployment",
+                "subscription_authentication_required",
+                "ChatGPT subscription access must be authenticated for this deployment",
             )
             .into());
         }

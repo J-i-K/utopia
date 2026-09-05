@@ -7,7 +7,7 @@ pub mod codex;
 pub use background::{
     BackgroundAuthFailure, BackgroundModelIdentity, BackgroundTextClient, BackgroundTextError,
 };
-pub use codex::{CodexAuthError, CodexAuthManager, CodexResponsesClient};
+pub use codex::{CodexAuthError, CodexAuthManager, CodexAuthStatus, CodexResponsesClient};
 
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};

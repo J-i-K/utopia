@@ -5,6 +5,7 @@ use fs2::FileExt;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -15,10 +16,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 const AUTH_FILE: &str = "auth.json";
 const LOCK_FILE: &str = ".utopia-codex.lock";
 const REFRESH_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
+const DEVICE_USERCODE_ENDPOINT: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
+const DEVICE_TOKEN_ENDPOINT: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
 const UNPARSEABLE_EXPIRY_REFRESH_INTERVAL: Duration = Duration::from_secs(8 * 24 * 60 * 60);
@@ -45,6 +50,13 @@ pub enum CodexAuthError {
     Transient(&'static str),
     #[error("Codex credential state could not be made durable: {0}")]
     Durability(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexAuthStatus {
+    Unauthenticated,
+    Authenticated,
+    Invalid,
 }
 
 impl CodexAuthError {
@@ -92,6 +104,9 @@ pub struct CodexAuthManager {
     refresh_lock: Arc<Mutex<()>>,
     http: Client,
     refresh_url: String,
+    device_usercode_url: String,
+    device_token_url: String,
+    device_oauth_url: String,
     disabled: Arc<AtomicBool>,
 }
 
@@ -107,7 +122,14 @@ impl fmt::Debug for CodexAuthManager {
 
 impl CodexAuthManager {
     pub fn new(home: impl AsRef<Path>) -> Result<Self, CodexAuthError> {
-        Self::build(home.as_ref(), REFRESH_ENDPOINT.to_string())
+        Self::build(home.as_ref(), REFRESH_ENDPOINT.to_string(), true)
+    }
+
+    /// Opens the dedicated credential home before the first login. The auth file
+    /// is intentionally optional here; dispatch still fails closed until login
+    /// has completed and a validated file has been atomically persisted.
+    pub fn new_for_auth(home: impl AsRef<Path>) -> Result<Self, CodexAuthError> {
+        Self::build(home.as_ref(), REFRESH_ENDPOINT.to_string(), false)
     }
 
     #[cfg(any(test, feature = "test-util"))]
@@ -115,10 +137,14 @@ impl CodexAuthManager {
         home: impl AsRef<Path>,
         refresh_url: impl Into<String>,
     ) -> Result<Self, CodexAuthError> {
-        Self::build(home.as_ref(), refresh_url.into())
+        Self::build(home.as_ref(), refresh_url.into(), true)
     }
 
-    fn build(home: &Path, refresh_url: String) -> Result<Self, CodexAuthError> {
+    fn build(
+        home: &Path,
+        refresh_url: String,
+        require_auth_file: bool,
+    ) -> Result<Self, CodexAuthError> {
         if !home.is_absolute() {
             return Err(CodexAuthError::Invalid(
                 "credential directory must be an absolute path",
@@ -127,7 +153,9 @@ impl CodexAuthManager {
         validate_path_components(home)?;
         validate_directory(home)?;
         let auth_path = home.join(AUTH_FILE);
-        validate_regular_file(&auth_path, "credential file")?;
+        if require_auth_file || auth_path.exists() {
+            validate_regular_file(&auth_path, "credential file")?;
+        }
 
         let lock_path = home.join(LOCK_FILE);
         validate_lock_path(&lock_path)?;
@@ -156,11 +184,184 @@ impl CodexAuthManager {
             refresh_lock: Arc::new(Mutex::new(())),
             http,
             refresh_url,
+            device_usercode_url: DEVICE_USERCODE_ENDPOINT.into(),
+            device_token_url: DEVICE_TOKEN_ENDPOINT.into(),
+            device_oauth_url: REFRESH_ENDPOINT.into(),
             disabled: Arc::new(AtomicBool::new(false)),
         };
         // Startup validates only local state. It deliberately performs no network call.
-        manager.load_snapshot()?;
+        if require_auth_file {
+            manager.load_snapshot()?;
+        }
         Ok(manager)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_device_urls(mut self, usercode: String, token: String, oauth: String) -> Self {
+        self.device_usercode_url = usercode;
+        self.device_token_url = token;
+        self.device_oauth_url = oauth;
+        self
+    }
+
+    pub async fn begin_device_auth(&self) -> Result<DeviceAuthSession, CodexAuthError> {
+        let verifier = Uuid::new_v4().to_string() + &Uuid::new_v4().to_string();
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let response = self
+            .http
+            .post(&self.device_usercode_url)
+            .json(&json!({ "client_id": OAUTH_CLIENT_ID }))
+            .send()
+            .await
+            .map_err(|_| CodexAuthError::Transient("device authentication transport failure"))?;
+        let status = response.status();
+        let body = read_bounded_body(response).await?;
+        if !status.is_success() {
+            return Err(CodexAuthError::Permanent(
+                "device authentication was rejected",
+            ));
+        }
+        let value: Value = serde_json::from_slice(&body).map_err(|_| {
+            CodexAuthError::Permanent("device authentication response is malformed")
+        })?;
+        let device_auth_id = required_string(&value, "device_auth_id").ok_or(
+            CodexAuthError::Permanent("device authentication response omitted its id"),
+        )?;
+        let user_code = required_string(&value, "user_code").ok_or(CodexAuthError::Permanent(
+            "device authentication response omitted its code",
+        ))?;
+        let verification_url = required_string(&value, "verification_url")
+            .or_else(|| required_string(&value, "verification_uri"))
+            .ok_or(CodexAuthError::Permanent(
+                "device authentication response omitted its URL",
+            ))?;
+        let interval = value
+            .get("interval")
+            .and_then(Value::as_u64)
+            .unwrap_or(5)
+            .clamp(1, 30);
+        let expires_in = value
+            .get("expires_in")
+            .and_then(Value::as_u64)
+            .unwrap_or(900)
+            .clamp(1, 1800);
+        Ok(DeviceAuthSession {
+            device_auth_id,
+            user_code,
+            verification_url,
+            verifier,
+            challenge,
+            interval: Duration::from_secs(interval),
+            expires_in: Duration::from_secs(expires_in),
+        })
+    }
+
+    pub async fn complete_device_auth(
+        &self,
+        session: &DeviceAuthSession,
+    ) -> Result<(), CodexAuthError> {
+        let deadline = tokio::time::Instant::now() + session.expires_in;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(CodexAuthError::Permanent("device authentication expired"));
+            }
+            tokio::time::sleep(session.interval).await;
+            let response = self.http.post(&self.device_token_url).json(&json!({ "device_auth_id": session.device_auth_id, "user_code": session.user_code })).send().await.map_err(|_| CodexAuthError::Transient("device authentication polling failed"))?;
+            let status = response.status();
+            let body = read_bounded_body(response).await?;
+            let value: Value = serde_json::from_slice(&body).map_err(|_| {
+                CodexAuthError::Permanent("device authentication poll response is malformed")
+            })?;
+            if status.is_success() {
+                let code = required_string(&value, "authorization_code")
+                    .or_else(|| required_string(&value, "code"))
+                    .ok_or(CodexAuthError::Permanent(
+                        "device authentication omitted authorization code",
+                    ))?;
+                let form = [
+                    ("grant_type", "authorization_code"),
+                    ("code", code.as_str()),
+                    ("redirect_uri", DEVICE_REDIRECT_URI),
+                    ("client_id", OAUTH_CLIENT_ID),
+                    ("code_verifier", session.verifier.as_str()),
+                ]
+                .into_iter()
+                .map(|(key, value)| format!("{}={}", key, form_escape(value)))
+                .collect::<Vec<_>>()
+                .join("&");
+                let response = self
+                    .http
+                    .post(&self.device_oauth_url)
+                    .header(
+                        reqwest::header::CONTENT_TYPE,
+                        "application/x-www-form-urlencoded",
+                    )
+                    .body(form)
+                    .send()
+                    .await
+                    .map_err(|_| {
+                        CodexAuthError::Transient("device authentication exchange failed")
+                    })?;
+                let exchange_status = response.status();
+                let exchange_body = read_bounded_body(response).await?;
+                if !exchange_status.is_success() {
+                    return Err(CodexAuthError::Permanent(
+                        "device authentication exchange was rejected",
+                    ));
+                }
+                let tokens: Value = serde_json::from_slice(&exchange_body).map_err(|_| {
+                    CodexAuthError::Permanent(
+                        "device authentication exchange response is malformed",
+                    )
+                })?;
+                let access =
+                    required_string(&tokens, "access_token").ok_or(CodexAuthError::Permanent(
+                        "device authentication exchange omitted access token",
+                    ))?;
+                let refresh =
+                    required_string(&tokens, "refresh_token").ok_or(CodexAuthError::Permanent(
+                        "device authentication exchange omitted refresh token",
+                    ))?;
+                let id = required_string(&tokens, "id_token").ok_or(CodexAuthError::Permanent(
+                    "device authentication exchange omitted ID token",
+                ))?;
+                let account_id = parse_jwt_claims(&id)
+                    .and_then(|claims| claims.account_id)
+                    .ok_or(CodexAuthError::Permanent(
+                        "device authentication ID token omitted account",
+                    ))?;
+                let value = json!({ "auth_mode": "chatgpt", "tokens": { "access_token": access, "refresh_token": refresh, "id_token": id, "account_id": account_id }, "last_refresh": DateTime::<Utc>::from(SystemTime::now()).to_rfc3339() });
+                self.persist(&value)?;
+                return Ok(());
+            }
+            let error = value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if matches!(error, "authorization_pending" | "slow_down") {
+                continue;
+            }
+            return Err(CodexAuthError::Permanent(
+                "device authentication was rejected",
+            ));
+        }
+    }
+
+    pub fn status(&self) -> CodexAuthStatus {
+        match self.load_snapshot() {
+            Ok((_, snapshot))
+                if snapshot
+                    .access_expiry
+                    .is_none_or(|expiry| expiry > SystemTime::now()) =>
+            {
+                CodexAuthStatus::Authenticated
+            }
+            Ok(_) => CodexAuthStatus::Unauthenticated,
+            Err(CodexAuthError::Invalid("credential file cannot be read")) => {
+                CodexAuthStatus::Unauthenticated
+            }
+            Err(_) => CodexAuthStatus::Invalid,
+        }
     }
 
     pub(crate) async fn snapshot(&self) -> Result<CredentialSnapshot, CodexAuthError> {
@@ -369,6 +570,19 @@ impl CodexAuthManager {
     }
 }
 
+/// Short-lived, server-only device flow state. Never serialize this type to a client.
+#[derive(Clone, Debug)]
+pub struct DeviceAuthSession {
+    pub user_code: String,
+    pub verification_url: String,
+    device_auth_id: String,
+    verifier: String,
+    #[allow(dead_code)]
+    challenge: String,
+    interval: Duration,
+    expires_in: Duration,
+}
+
 struct RefreshMaterial {
     access_token: String,
     refresh_token: String,
@@ -552,6 +766,19 @@ fn parse_timestamp(raw: &str) -> Option<SystemTime> {
     UNIX_EPOCH.checked_add(Duration::from_secs(timestamp as u64))
 }
 
+fn form_escape(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            b' ' => vec!['+'],
+            other => format!("%{other:02X}").chars().collect(),
+        })
+        .collect()
+}
+
 fn required_string(value: &Value, key: &str) -> Option<String> {
     value
         .get(key)
@@ -687,7 +914,7 @@ fn validate_private_permissions(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use wiremock::matchers::{body_json, method, path};
+    use wiremock::matchers::{body_json, body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn jwt(exp: Option<u64>, account_id: &str, fedramp: bool) -> String {
@@ -812,6 +1039,17 @@ mod tests {
     }
 
     #[test]
+    fn auth_status_distinguishes_valid_and_expired_credentials() {
+        let valid = home_with_tokens(Some(3600));
+        let manager = CodexAuthManager::new(valid.path()).unwrap();
+        assert_eq!(manager.status(), CodexAuthStatus::Authenticated);
+
+        let expired = home_with_tokens(Some(0));
+        let manager = CodexAuthManager::new(expired.path()).unwrap();
+        assert_eq!(manager.status(), CodexAuthStatus::Unauthenticated);
+    }
+
+    #[test]
     fn unparseable_expiry_uses_the_eight_day_last_refresh_fallback() {
         let dir = home_with_tokens(None);
         let value = json!({
@@ -906,5 +1144,61 @@ mod tests {
                 .unwrap();
         let error = manager.snapshot().await.unwrap_err();
         assert!(matches!(error, CodexAuthError::Permanent(_)));
+    }
+
+    #[tokio::test]
+    async fn device_flow_uses_bounded_server_side_exchange_and_persists_private_auth() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/usercode"))
+            .and(body_json(json!({"client_id": OAUTH_CLIENT_ID})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "device_auth_id": "device-fixture", "user_code": "ABCD-EFGH",
+                "verification_url": "https://auth.example/activate", "interval": 1, "expires_in": 2
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/device-token"))
+            .and(body_json(
+                json!({"device_auth_id": "device-fixture", "user_code": "ABCD-EFGH"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"authorization_code": "code-fixture"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth-token"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .and(body_string_contains("code_verifier="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-fixture", "refresh_token": "refresh-fixture",
+                "id_token": jwt(Some(4102444800), "account-fixture", false)
+            })))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let manager = CodexAuthManager::new_for_auth(dir.path())
+            .unwrap()
+            .with_device_urls(
+                format!("{}/usercode", server.uri()),
+                format!("{}/device-token", server.uri()),
+                format!("{}/oauth-token", server.uri()),
+            );
+        let session = manager.begin_device_auth().await.unwrap();
+        assert_eq!(session.user_code, "ABCD-EFGH");
+        manager.complete_device_auth(&session).await.unwrap();
+        assert_eq!(manager.status(), CodexAuthStatus::Authenticated);
+        assert_eq!(
+            fs::metadata(dir.path().join(AUTH_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 }

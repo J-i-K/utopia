@@ -99,6 +99,18 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
             "/admin/deployment",
             get(admin_routes::get_deployment).put(admin_routes::put_deployment),
         )
+        .route(
+            "/admin/deployment/codex-auth/start",
+            post(admin_routes::start_codex_auth),
+        )
+        .route(
+            "/admin/deployment/codex-auth/status",
+            get(admin_routes::codex_auth_status),
+        )
+        .route(
+            "/admin/deployment/codex-auth/cancel",
+            post(admin_routes::cancel_codex_auth),
+        )
         .route("/admin/users", post(admin_routes::create_user))
         // 停用 / 恢复账号（见 `users.deactivated_at`）。DELETE 的语义是「这个人不再有访问权」,
         // 而不是「这一行没了」——归因照旧查得到

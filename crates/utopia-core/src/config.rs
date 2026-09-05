@@ -12,6 +12,14 @@ pub enum BackgroundLlmProvider {
     CodexResponses,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAuthSource {
+    #[default]
+    Internal,
+    Preauthenticated,
+}
+
 /// 全局配置。来源优先级：环境变量（前缀 `UTOPIA_`）> 默认值。
 /// `.env` 文件由二进制入口通过 dotenvy 预加载进环境变量。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,8 +52,11 @@ pub struct AppConfig {
     pub background_llm_provider: BackgroundLlmProvider,
     /// Required only when `background_llm_provider=codex_responses`.
     pub codex_model: Option<String>,
-    /// Dedicated, absolute, file-backed Codex credential directory.
+    /// Dedicated, absolute, file-backed Codex credential directory for preauthenticated mode.
     pub codex_home: Option<String>,
+    /// Internal Utopia login is the default; CODEX_HOME is read-only fallback when selected.
+    #[serde(default)]
+    pub codex_auth_source: CodexAuthSource,
     /// Codex background call cap. Deliberately bounded to avoid subscription request storms.
     pub codex_max_concurrency: u32,
 }
@@ -65,6 +76,7 @@ impl Default for AppConfig {
             background_llm_provider: BackgroundLlmProvider::ChatCompletions,
             codex_model: None,
             codex_home: None,
+            codex_auth_source: CodexAuthSource::Internal,
             codex_max_concurrency: 1,
         }
     }
@@ -88,12 +100,13 @@ impl AppConfig {
             {
                 anyhow::bail!("UTOPIA_CODEX_MODEL is required for Codex Responses mode");
             }
-            if self
-                .codex_home
-                .as_deref()
-                .is_none_or(|home| home.trim().is_empty())
+            if self.codex_auth_source == CodexAuthSource::Preauthenticated
+                && self
+                    .codex_home
+                    .as_deref()
+                    .is_none_or(|home| home.trim().is_empty())
             {
-                anyhow::bail!("UTOPIA_CODEX_HOME is required for Codex Responses mode");
+                anyhow::bail!("UTOPIA_CODEX_HOME is required for preauthenticated Codex mode");
             }
             if !(1..=8).contains(&self.codex_max_concurrency) {
                 anyhow::bail!("UTOPIA_CODEX_MAX_CONCURRENCY must be between 1 and 8");

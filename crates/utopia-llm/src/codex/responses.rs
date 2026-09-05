@@ -35,6 +35,18 @@ impl std::fmt::Debug for CodexResponsesClient {
 }
 
 impl CodexResponsesClient {
+    pub async fn begin_device_auth(
+        &self,
+    ) -> Result<super::auth::DeviceAuthSession, CodexAuthError> {
+        self.auth.begin_device_auth().await
+    }
+
+    pub async fn complete_device_auth(
+        &self,
+        session: &super::auth::DeviceAuthSession,
+    ) -> Result<(), CodexAuthError> {
+        self.auth.complete_device_auth(session).await
+    }
     pub fn new(
         auth: Arc<CodexAuthManager>,
         model: impl Into<String>,
@@ -104,6 +116,10 @@ impl CodexResponsesClient {
             endpoint_key: self.base_url.clone(),
             model: self.model.clone(),
         }
+    }
+
+    pub fn auth_status(&self) -> crate::codex::CodexAuthStatus {
+        self.auth.status()
     }
 
     pub async fn complete(&self, messages: &[ChatMessage]) -> Result<String, BackgroundTextError> {

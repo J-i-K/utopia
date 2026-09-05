@@ -114,7 +114,18 @@ function DeploymentAdmin() {
   const dep = useQuery({
     queryKey: ["deployment"],
     queryFn: api.adminDeployment,
+    refetchInterval: (query) =>
+      query.state.data?.subscription_auth_flow.status === "pending" ? 1000 : false,
   });
+  const authStart = useMutation({
+    mutationFn: api.startAdminCodexAuth,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["deployment"] }),
+  });
+  const authCancel = useMutation({
+    mutationFn: api.cancelAdminCodexAuth,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["deployment"] }),
+  });
+  const authFlow = dep.data?.subscription_auth_flow;
   const [workers, setWorkers] = useState<number | null>(null);
   const shown = workers ?? dep.data?.worker_concurrency ?? 32;
   // 按模型的并发：缺省值 + 每个在用模型的覆盖
@@ -167,6 +178,37 @@ function DeploymentAdmin() {
           </span>
         </span>
       </label>
+
+      <div className="border-t border-white/10 pt-4">
+        <span className="block text-sm text-neutral-200">
+          {S.settings.deployment.codexAuth}
+        </span>
+        <p className="mt-0.5 text-xs text-neutral-500">
+          {S.settings.deployment.codexAuthHint}
+        </p>
+        {authFlow?.status === "pending" && authFlow.user_code && authFlow.verification_url ? (
+          <div className="mt-2 space-y-2 rounded bg-black/20 px-2 py-2 text-xs text-neutral-300">
+            <div>Open <a className="text-[var(--u-accent)] underline" href={authFlow.verification_url} target="_blank" rel="noreferrer">{authFlow.verification_url}</a></div>
+            <div>Code: <strong className="font-mono">{authFlow.user_code}</strong></div>
+            <button className="u-btn u-btn-ghost px-2 py-1 text-[11px]" onClick={() => authCancel.mutate()} disabled={authCancel.isPending}>Cancel</button>
+          </div>
+        ) : (
+          <button className="u-btn u-btn-ghost mt-2 px-3 py-1.5 text-xs" onClick={() => authStart.mutate()} disabled={authStart.isPending || authFlow?.status === "starting"}>
+            {authFlow?.status === "authenticated" ? "Re-authenticate Codex" : "Authenticate ChatGPT subscription"}
+          </button>
+        )}
+        {dep.data && (
+          <p className={`mt-2 text-xs ${
+            dep.data.subscription_auth_status === "authenticated"
+              ? "text-[var(--u-accent)]"
+              : "text-amber-400/80"
+          }`}>
+            {S.settings.deployment.codexAuthStatus(
+              dep.data.subscription_auth_status,
+            )}
+          </p>
+        )}
+      </div>
 
       {/* 新建库的本体语言。**不是界面语言**——界面语言是每个人自己在账户菜单里选的，
           根本不经过后端（docs/decisions/0004）。说明里必须把这句讲出来 */}
@@ -831,6 +873,8 @@ export function Settings() {
   const label = "block text-xs font-medium text-neutral-400 mb-1";
   const openAiChat = isOpenAiBaseUrl(form.chat_base_url);
   const subscriptionAvailable = settings.data?.subscription_available === true;
+  const subscriptionAuthenticated =
+    settings.data?.subscription_authenticated === true;
 
   return (
     <div className="h-full overflow-y-auto p-6">
@@ -926,7 +970,7 @@ export function Settings() {
                     <option value="api">{S.settings.chatAccessApi}</option>
                     <option
                       value="subscription"
-                      disabled={!subscriptionAvailable}
+                      disabled={!subscriptionAvailable || !subscriptionAuthenticated}
                     >
                       {S.settings.chatAccessSubscription}
                     </option>
@@ -939,6 +983,11 @@ export function Settings() {
                   {!subscriptionAvailable && (
                     <p className="mt-1 text-[11px] leading-relaxed text-amber-400/80">
                       {S.settings.chatAccessUnavailable}
+                    </p>
+                  )}
+                  {subscriptionAvailable && !subscriptionAuthenticated && (
+                    <p className="mt-1 text-[11px] leading-relaxed text-amber-400/80">
+                      {S.settings.deployment.codexAuthRequired}
                     </p>
                   )}
                 </div>
