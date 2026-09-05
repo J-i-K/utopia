@@ -3,7 +3,12 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet, useNavigate } from "@tanstack/react-router";
 import { usePageTitle } from "../useTitle";
-import { BookMarked, KeyRound, ShieldCheck, UserRound } from "lucide-react";
+import {
+  KeyRound,
+  Layers,
+  ShieldCheck,
+  UserRound,
+} from "lucide-react";
 import { api, ApiError } from "../api";
 import { S } from "../i18n";
 import {
@@ -13,6 +18,7 @@ import {
   SectionMark,
 } from "../ui";
 import { ServerDown } from "./ServerDown";
+import { AlertBell } from "./AlertBell";
 import { UserMenu } from "./UserMenu";
 
 export function AccountShell() {
@@ -62,6 +68,8 @@ export function AccountShell() {
             <GithubMark size={13} />
             {health.data && <span className="u-num text-fine">v{health.data.version}</span>}
           </a>
+          {/* 告警角标跟着人走，不跟着页面走：在账户页里库照样在跑、照样会出事 */}
+          <AlertBell />
           <div className="ml-2">
             <UserMenu user={me.data} />
           </div>
@@ -82,7 +90,7 @@ export function AccountShell() {
             {S.account.profile}
           </Link>
           <Link to="/account/kbs" className={rail} activeProps={{ className: railActive }}>
-            <BookMarked size={14} />
+            <Layers size={14} />
             {S.account.kbsNav}
           </Link>
           <Link to="/account/tokens" className={rail} activeProps={{ className: railActive }}>

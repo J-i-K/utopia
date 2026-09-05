@@ -17,6 +17,7 @@ import {
   rowClass,
   SectionMark,
 } from "../ui";
+import { AlertBell } from "./AlertBell";
 import { UserMenu } from "./UserMenu";
 import { usePageTitle } from "../useTitle";
 import ingestMd from "../docs/ingest.md?raw";
@@ -205,7 +206,7 @@ export function DocsPage() {
             )}
           </div>
           {q.trim().length >= 2 && (
-            <div className="u-pop u-pop-in u-pop-in-tl absolute inset-x-0 top-full mt-2 rounded-xl shadow-2xl overflow-hidden">
+            <div className="u-menu-glass u-pop-in u-pop-in-tl absolute inset-x-0 top-full mt-2 rounded-xl shadow-2xl overflow-hidden">
               {results.length === 0 ? (
                 <p className="px-4 py-3 text-small text-ink-3">{S.docs.noResults}</p>
               ) : (
@@ -249,9 +250,14 @@ export function DocsPage() {
             {health.data && <span className="u-num text-fine">v{health.data.version}</span>}
           </a>
           {me.data ? (
-            <div className="ml-1">
-              <UserMenu user={me.data} />
-            </div>
+            <>
+              {/* 告警角标跟着人走：读文档的时候库也在跑。没登录就没有它——
+                  告警是登录后的东西 */}
+              <AlertBell />
+              <div className="ml-1">
+                <UserMenu user={me.data} />
+              </div>
+            </>
           ) : me.isError ? (
             <Link
               to="/login"

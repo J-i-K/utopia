@@ -16,6 +16,8 @@ import {
   Database,
   GitCompareArrows,
   History,
+  Layers,
+  MessageSquare,
   MoreHorizontal,
   Search,
   Search as SearchIcon,
@@ -392,14 +394,16 @@ export function Chat() {
         <div className="flex items-center gap-3 min-w-0">
           {/* 作用域 chip：提问点位可见"在问哪个库"，切库沿用现有语义（开新会话） */}
           <div ref={scopeRef} className="relative shrink-0">
+            {/* 左内距去掉：图标的左缘落在上面占位符的起点上，与顶栏切换器同一个
+                图标——两处都是「在哪个库」 */}
             <Button
               variant="ghost"
               size="sm"
-              className="max-w-52"
+              className="max-w-52 border-0 pl-0"
               title={S.ask.scopeLabel}
               onClick={() => setScopeOpen((v) => !v)}
             >
-              <Database size={12} className="shrink-0 text-ink-3" />
+              <Layers size={12} className="shrink-0 text-ink-3" />
               <span className="truncate">{kb?.name ?? "…"}</span>
               <ChevronDown
                 size={11}
@@ -407,8 +411,8 @@ export function Chat() {
               />
             </Button>
             {scopeOpen && (
-              <div className="u-pop u-pop-up absolute bottom-full mb-2 left-0 z-50 w-56 rounded-lg shadow-xl overflow-hidden">
-                <div className="px-3 pt-2 pb-1 text-fine font-medium uppercase tracking-[0.1em] text-ink-3 border-b border-line">
+              <div className="u-menu-glass u-pop-up absolute bottom-full mb-2 left-0 z-50 w-56 rounded-xl shadow-2xl overflow-hidden">
+                <div className="border-b border-line px-4 py-3 text-body font-medium text-ink">
                   {S.ask.scopeLabel}
                 </div>
                 <div className="u-scroll max-h-60 overflow-y-auto">
@@ -477,13 +481,15 @@ export function Chat() {
             onKeyDown={(e) => e.key === "Escape" && setConvSearch("")}
           />
         </div>
-        <div className="px-2 pb-1">
+        {/* 左栏里的一切都从 12 起：输入框的盒、行的盒；图标都在 20，文字都在 42。
+            会话行也带一个图标，不然它的标题会从 20 起，和上面两行错开 */}
+        <div className="px-3 pb-1">
           {/* 与会话行同一套样式：左栏是一列同质的行，新对话只是第一行 */}
           <Row density="nav" icon={<SquarePen size={14} />} onClick={newChat}>
             {S.ask.newChat}
           </Row>
         </div>
-        <div className="u-scroll flex-1 overflow-y-auto px-2 pb-3 space-y-1">
+        <div className="u-scroll flex-1 overflow-y-auto px-3 pb-3 space-y-1">
           {(convs.data?.conversations ?? []).map((c: ConversationRow) => (
             <div
               key={c.id}
@@ -507,6 +513,7 @@ export function Chat() {
                 <Row
                   density="nav"
                   active={c.id === activeId}
+                  icon={<MessageSquare size={14} />}
                   className="pr-8"
                   onClick={() => openConversation(c.id)}
                 >
@@ -574,8 +581,9 @@ export function Chat() {
               )}
             </div>
           ))}
+          {/* 没图标的文字从 20 起（盒 12 + 8），与行里的图标同一条线 */}
           {convs.data?.conversations.length === 0 && (
-            <p className="px-3 py-2 text-small text-ink-3">{S.ask.noConversations}</p>
+            <p className="px-2 py-2 text-small text-ink-3">{S.ask.noConversations}</p>
           )}
         </div>
       </aside>

@@ -8,6 +8,7 @@ import {
 } from "@tanstack/react-router";
 import {
   Database,
+  Layers,
   Library as LibraryIcon,
   ListChecks,
   MessagesSquare,
@@ -94,19 +95,23 @@ export function Shell() {
       {/* 顶栏：品牌 + 工作区 + 用户（Vercel 式） */}
       {/* z-40：backdrop-filter 使顶栏与 tab 条各自成 stacking context，
           不提权则后者按 DOM 序盖住顶栏内的弹出面板 */}
-      <header className="glass-strong relative z-40 border-x-0 border-t-0 h-14 shrink-0 flex items-center gap-4 px-6">
+      {/* 左内距 32px：字标的左缘落在下面第一个标签的图标上（nav px-4 + 标签
+          px-4）。字标与切换器之间 gap-4：切换器的图标正好落在第二个标签的图标上
+          （英文界面下的巧合，字标一换字号就得重量）——两行同一套节奏 */}
+      <header className="glass-strong relative z-40 border-x-0 border-t-0 h-14 shrink-0 flex items-center gap-4 px-8">
         {/* 字标：逐字母淡入，hover 浮出 ↗，点击去官网 */}
-        <Wordmark className="text-title" />
-        {/* 面包屑唯一一级：知识库。Workspace 已从概念层折叠为部署级隐形管道
-            （settings/members 仍经它走 API，如 organizations 之于单租户）。 */}
-        <span className="text-ink-3">/</span>
-        {/* 纯切换器：建库是管理动作，入口在 System settings › Knowledge bases */}
-        {/* 没有图标：字标已经在左边，这里就是库的名字；箭头贴着名字，不顶到
-            一个固定宽度的右边去 */}
+        <Wordmark className="text-display" />
+        {/* 知识库切换器紧跟字标，中间不画斜杠——它不是面包屑的第二级，就是
+            「现在在哪个库」。Workspace 已从概念层折叠为部署级隐形管道
+            （settings/members 仍经它走 API，如 organizations 之于单租户）。
+            左边的图标与账户页左栏「Knowledge bases」那一项同一个，说明这一串字
+            是库名；中号字与下面的标签同一个字号；箭头贴着名字，不顶到一个固定
+            宽度的右边去。
+            纯切换器：建库是管理动作，入口在 System settings › Knowledge bases */}
         <Dropdown
           bare
           className="max-w-64"
-          size="sm"
+          icon={<Layers size={13} />}
           menuLabel={S.nav.kbLabel}
           value={kb?.id ?? ""}
           onChange={setKb}
