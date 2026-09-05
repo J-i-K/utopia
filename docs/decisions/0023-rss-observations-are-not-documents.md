@@ -1,4 +1,4 @@
-# 0022 · RSS observations are not documents
+# 0023 · RSS observations are not documents
 
 - **Status**: Implemented in #326
 - **Written**: 2026-09-05

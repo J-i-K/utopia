@@ -149,7 +149,10 @@ test("production SourceModal RSS submissions", { timeout: 90_000 }, async (t) =>
           return route.abort();
         });
         await page.goto(`${origin}/rss-test`);
-        await page.getByRole("button", { name: "RSS feed", exact: true }).click();
+        // Upstream source kinds now live in the real modal's dropdown.
+        const dialog = page.getByRole("dialog");
+        await dialog.getByRole("button", { name: "Folder", exact: true }).click();
+        await dialog.getByRole("button", { name: "RSS feed", exact: true }).click();
         const modeSelect = page.locator("select").filter({ has: page.locator('option[value="full_new_items"]') });
         assert.equal(await modeSelect.count(), 1);
         assert.equal(await modeSelect.inputValue(), "feed", "RSS must initially display feed-only");
