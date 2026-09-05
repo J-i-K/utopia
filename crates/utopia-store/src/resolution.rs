@@ -21,6 +21,21 @@ use uuid::Uuid;
 pub const SIM_ATTACH: f32 = 0.55;
 pub const SIM_NEW: f32 = 0.35;
 
+/// 同名并列的判定边界：两个**同名**候选的画像分数相差不超过这个值，就算「分不开」。
+/// 画像分不出谁是谁时，attach 到分高的那个只是候选顺序掷出的硬币（#270）——
+/// 与其掷硬币，不如两个都不并、都入人工审核。取值偏紧：真正拉得开的同名人（不同
+/// chunk、不同事实积累）分差远大于此，只有质心几乎重合（如同一 chunk 播种）才触发。
+pub const SIM_TIE_MARGIN: f32 = 0.02;
+
+/// 旁证宾语的最短长度。低于它的（"IT"、"A 组"）在任何一篇文档里都可能出现，
+/// 命中不含信息量。**宁可漏掉一条旁证**：漏了就是今天的行为，错了会并错人。
+const MIN_CORROBORATION_CHARS: usize = 2;
+
+/// 每个候选取几个消歧宾语参与旁证。取多个是因为文档提到的未必是排序最靠前的
+/// 那一个（他的部门写在这句、职位写在下一句），但也不能全取——候选的事实越多，
+/// 撞上一个泛泛的宾语的机会越大。
+const CORROBORATION_OBJECTS: i64 = 3;
+
 /// 名称规范化：全角 ASCII → 半角、全角空格 → 半角、空白折叠。
 /// 返回展示形态（保留大小写）；匹配一律再套 SQL lower()。
 pub fn normalize_name(raw: &str) -> String {
@@ -175,6 +190,7 @@ fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
 #[derive(Debug, sqlx::FromRow)]
 struct Candidate {
     id: Uuid,
+    canonical_name: String,
     profile_embedding: Option<Vector>,
     profile_n: i32,
     degree: i64,
@@ -195,6 +211,9 @@ pub struct ReviewRequest {
     pub other_id: Uuid,
     pub score: f32,
     pub reason: String,
+    /// 交给谁裁：画像灰区走 [`ReviewStage::Adjudicating`]（批量裁决器），
+    /// 同名并列只有人分得开，走 [`ReviewStage::Human`]。
+    pub stage: ReviewStage,
 }
 
 /// 审核项由谁消费。普通画像灰区先交给批量裁决器；抽取器在同一回复里明确拆出的
@@ -223,6 +242,9 @@ pub async fn resolve_mention(
     type_id: Option<Uuid>,
     raw_name: &str,
     context: Option<&[f32]>,
+    // 这次提及所在的**块原文**。画像分不出谁是谁时拿它做事实旁证（#331）——
+    // 传整篇文档会让每个部门都命中，所以这里要的是句子或块，不是文档。
+    text: Option<&str>,
     // Candidates already claimed by a different response-local handle. They remain stored
     // and recallable on later calls, but this mention cannot attach to them.
     exclude: &[Uuid],
@@ -232,7 +254,7 @@ pub async fn resolve_mention(
     // 只扩召回，归并与否仍由下方画像相似度分层定夺。
     let keys = recall_keys(&name);
     let candidates: Vec<Candidate> = sqlx::query_as(
-        "SELECT e.id, e.profile_embedding, e.profile_n,
+        "SELECT e.id, e.canonical_name, e.profile_embedding, e.profile_n,
                 (SELECT count(*) FROM facts f
                  WHERE (f.subject_id = e.id OR f.object_id = e.id)
                    AND f.invalidated_at IS NULL) AS degree
@@ -271,7 +293,7 @@ pub async fn resolve_mention(
     };
 
     // 有画像的候选算相似度；无画像（历史数据/无 embedding 期创建）单独归类
-    let mut best_scored: Option<(&Candidate, f32)> = None;
+    let mut scored: Vec<(&Candidate, f32)> = Vec::new();
     let mut unprofiled: Option<&Candidate> = None;
     for c in &candidates {
         match c
@@ -279,11 +301,7 @@ pub async fn resolve_mention(
             .as_ref()
             .and_then(|p| cosine(p.as_slice(), ctx))
         {
-            Some(sim) => {
-                if best_scored.map(|(_, s)| sim > s).unwrap_or(true) {
-                    best_scored = Some((c, sim));
-                }
-            }
+            Some(sim) => scored.push((c, sim)),
             None => {
                 if unprofiled.map(|u| c.degree > u.degree).unwrap_or(true) {
                     unprofiled = Some(c);
@@ -291,9 +309,61 @@ pub async fn resolve_mention(
             }
         }
     }
+    // 最高分候选：并列时保留先遇到的那个（与旧的 `sim > s` 严格大于一致）
+    let best_scored = scored
+        .iter()
+        .copied()
+        .reduce(|acc, cur| if cur.1 > acc.1 { cur } else { acc });
 
     if let Some((best, sim)) = best_scored {
         if sim >= SIM_ATTACH {
+            // 同名并列的灰区：另有一个**同名**候选的分数贴着最高分（差 ≤ SIM_TIE_MARGIN），
+            // 画像分不出谁是谁——attach 到分高的那个只是候选顺序掷出的硬币（#270）。
+            // 宁分勿合：不 attach，新建实体，对并列的两个候选各入一条**人工**审核对。
+            // 分数无论多高都拦：高分并列正是静默错并的危险区，不能因为「够像」就放行。
+            if let Some((runner, r_sim)) = scored
+                .iter()
+                .copied()
+                .filter(|(c, s)| {
+                    // 同名比较要与召回一致地忽略大小写：召回用 SQL `lower()`，
+                    // 「Zhang Wei」与「zhang wei」本就是一对同名候选，不能漏。
+                    c.id != best.id
+                        && c.canonical_name.to_lowercase() == best.canonical_name.to_lowercase()
+                        && sim - *s <= SIM_TIE_MARGIN
+                })
+                .reduce(|acc, cur| if cur.1 > acc.1 { cur } else { acc })
+            {
+                // 画像掷硬币之前，先问事实（#331）：这句话里提到了其中一个人的
+                // 部门或职位吗？提到了就不是硬币，是线索
+                if let Some(t) = text {
+                    if let Some(c) =
+                        corroborating_candidate(pool, kb_id, &[best, runner], t).await?
+                    {
+                        update_profile(pool, c.id, c.profile_n, ctx).await?;
+                        return Ok(Resolution {
+                            entity_id: c.id,
+                            created: false,
+                            reviews: Vec::new(),
+                        });
+                    }
+                }
+                let id = create_entity(pool, kb_id, type_id, &name, context).await?;
+                refresh_disambiguators(pool, kb_id, &name).await?;
+                let reviews = [(best, sim), (runner, r_sim)]
+                    .into_iter()
+                    .map(|(c, s)| ReviewRequest {
+                        other_id: c.id,
+                        score: s,
+                        reason: format!("namesake_tie|{s:.2}"),
+                        stage: ReviewStage::Human,
+                    })
+                    .collect();
+                return Ok(Resolution {
+                    entity_id: id,
+                    created: true,
+                    reviews,
+                });
+            }
             update_profile(pool, best.id, best.profile_n, ctx).await?;
             return Ok(Resolution {
                 entity_id: best.id,
@@ -312,7 +382,27 @@ pub async fn resolve_mention(
         });
     }
 
-    // 走到这里：所有候选都有画像且最高分 < ATTACH → 新建实体（同名不同人）
+    // 走到这里：所有候选都有画像且最高分 < ATTACH → 新建实体（同名不同人）。
+    //
+    // 但先问一次事实（#331）。灰区的意思是"向量说不好"，不是"一定是新人"——
+    // 这句话里若正好写着某一个候选的部门或职位，那比余弦值可靠。
+    // **只认灰区**（≥ SIM_NEW）：分数低于它的候选连审核对都不配入队，
+    // 拿一条旁证把它拉成同一人，等于绕过阈值而不是补充它。
+    if let Some(t) = text {
+        let in_grey: Vec<&Candidate> = scored
+            .iter()
+            .filter(|(_, s)| *s >= SIM_NEW)
+            .map(|(c, _)| *c)
+            .collect();
+        if let Some(c) = corroborating_candidate(pool, kb_id, &in_grey, t).await? {
+            update_profile(pool, c.id, c.profile_n, ctx).await?;
+            return Ok(Resolution {
+                entity_id: c.id,
+                created: false,
+                reviews: Vec::new(),
+            });
+        }
+    }
     let id = create_entity(pool, kb_id, type_id, &name, context).await?;
     refresh_disambiguators(pool, kb_id, &name).await?;
     let mut reviews = best_scored
@@ -322,6 +412,7 @@ pub async fn resolve_mention(
                 other_id: c.id,
                 score: sim,
                 reason: format!("ambiguous_name|{sim:.2}"),
+                stage: ReviewStage::Adjudicating,
             }]
         })
         .unwrap_or_default();
@@ -333,6 +424,85 @@ pub async fn resolve_mention(
         created: true,
         reviews,
     })
+}
+
+/// **事实旁证**：这次提及的原文里，出现了某个候选的消歧宾语吗（#331）。
+///
+/// 画像向量分不出谁是谁时，能分开的线索往往就在事实里——一个张伟 `works_for`
+/// 平台工程部，另一个 `works_for` 财务部，而这句话里写着"财务"。人在审核卡上
+/// 看的正是这些事实（`top_facts`），这一步是把人做的事交回给代码。
+///
+/// **证据只往一个方向走。** 一致是"同一人"的弱证据；不一致**什么都不是**——
+/// 在 Acme 上班又在 Zenith 兼职的人有两个 `works_for` 值，他仍是一个人。所以
+/// 这个函数只回答"哪个候选被原文提到了"，永远不回答"哪个候选被排除了"。
+///
+/// **恰好一个候选命中才算数。** 两个都命中说明这条线索在他们之间也分不开，
+/// 与其挑一个不如维持原样。
+///
+/// 宾语的挑法与 `refresh_disambiguators` 同源（#299 之后从本体的 range 声明选，
+/// 不是词表），并且**排除同名同伴也指着的那些**：两个张伟都在同一家公司时，
+/// 公司名对分辨他们毫无帮助，却最容易在文档里撞上。
+async fn corroborating_candidate<'a>(
+    pool: &PgPool,
+    kb_id: Uuid,
+    candidates: &[&'a Candidate],
+    text: &str,
+) -> AppResult<Option<&'a Candidate>> {
+    // 单个候选也算数：「其他候选都没命中」在只有一个候选时天然成立
+    if candidates.is_empty() || text.trim().is_empty() {
+        return Ok(None);
+    }
+    let ids: Vec<Uuid> = candidates.iter().map(|c| c.id).collect();
+    // 一次查完所有候选：每个候选取若干个「同伴不指向」的宾语名字
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT s.subject_id, s.name FROM (
+           SELECT f.subject_id, o.canonical_name AS name,
+                  row_number() OVER (
+                    PARTITION BY f.subject_id
+                    ORDER BY EXISTS (SELECT 1 FROM relation_type_ranges rr
+                                      WHERE rr.relation_type_id = r.id) DESC,
+                             (r.temporal = 'state') DESC,
+                             r.functional DESC,
+                             f.confidence DESC, f.recorded_at DESC
+                  ) AS rn
+           FROM facts f
+           JOIN relation_types r ON r.id = f.predicate_id
+           JOIN entities o ON o.id = f.object_id
+           WHERE f.kb_id = $1 AND f.subject_id = ANY($2)
+             AND f.invalidated_at IS NULL AND f.object_id IS NOT NULL
+             -- 同名同伴也指着的宾语没有分辨力，排除
+             AND NOT EXISTS (SELECT 1 FROM facts g
+                              WHERE g.kb_id = $1 AND g.subject_id = ANY($2)
+                                AND g.subject_id <> f.subject_id
+                                AND g.object_id = f.object_id
+                                AND g.invalidated_at IS NULL)
+         ) s WHERE s.rn <= $3",
+    )
+    .bind(kb_id)
+    .bind(&ids)
+    .bind(CORROBORATION_OBJECTS)
+    .fetch_all(pool)
+    .await?;
+
+    let haystack = text.to_lowercase();
+    let mut hit: Option<&'a Candidate> = None;
+    for (subject_id, object_name) in &rows {
+        let needle = object_name.trim().to_lowercase();
+        if needle.chars().count() < MIN_CORROBORATION_CHARS || !haystack.contains(&needle) {
+            continue;
+        }
+        let Some(c) = candidates.iter().find(|c| c.id == *subject_id) else {
+            continue;
+        };
+        match hit {
+            // 同一个候选的第二条宾语也命中：仍是同一个候选，不算分歧
+            Some(prev) if prev.id == c.id => {}
+            // 命中了第二个候选：这条线索分不开他们
+            Some(_) => return Ok(None),
+            None => hit = Some(c),
+        }
+    }
+    Ok(hit)
 }
 
 /// 包含关系候选的最短边：两个名字里**较短的那个**至少这么长才算数。
@@ -467,6 +637,7 @@ async fn containment_reviews(
                 other_id: id,
                 score,
                 reason: format!("contains|{other_name}"),
+                stage: ReviewStage::Adjudicating,
             }
         })
         .collect())
@@ -588,6 +759,7 @@ fn confusable_reviews(
                 other_id: c.id,
                 score: sim.unwrap_or(0.0),
                 reason: drift_reason(mention_key, c.type_key.as_deref(), sim),
+                stage: ReviewStage::Adjudicating,
             }
         })
         .collect()
@@ -725,6 +897,7 @@ async fn resolve_type_drift(
                 other_id: c.id,
                 score: sim.unwrap_or(0.0),
                 reason: drift_reason(mention_key.as_deref(), c.type_key.as_deref(), sim),
+                stage: ReviewStage::Adjudicating,
             }),
         }
     }

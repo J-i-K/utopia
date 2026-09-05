@@ -227,11 +227,10 @@ export interface RssFullContentEntryDiagnostic {
   has_article_url: boolean;
   document_time: string | null;
   updated_at: string;
-  state: "pending" | "queued" | "hydrating" | "retry_wait" | "complete" | "terminal";
+  state: "baseline" | "pending" | "queued" | "hydrating" | "retry_wait" | "complete" | "terminal" | "deleted" | "superseded";
   attempt_count: number;
   error_code: string | null;
   error_detail: string | null;
-  content_source: "feed" | "web" | null;
   document_id: string | null;
   completed_at: string | null;
 }

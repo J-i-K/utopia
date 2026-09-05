@@ -85,7 +85,7 @@ pub async fn list(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<SourceView>> {
     // 键在 `SOURCE_SECRET_KEYS` 一张表上——从前这里只减 `auth_header`，五种连接器
     // 的密钥就这么漏出去的（#246）
     let rows: Vec<SourceView> = sqlx::query_as(
-        "SELECT s.id, s.kind, s.name, s.config - $2::text[] AS config, s.icon,
+        &format!("WITH projected AS ({}) SELECT s.id, s.kind, s.name, s.config - $2::text[] AS config, s.icon,
                 s.sync_interval_minutes, s.sync_cron,
                 s.last_sync_at, s.last_sync_status, s.last_sync_error, s.last_sync_added,
                 (SELECT count(*) FROM documents d
@@ -93,33 +93,28 @@ pub async fn list(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<SourceView>> {
                 (SELECT count(*) FROM documents d
                  WHERE d.source_id = s.id AND d.missing_since IS NOT NULL
                    AND d.deleted_at IS NULL) AS missing_count,
-                (SELECT r.activation_state FROM rss_full_content_sources r
-                 WHERE r.source_id = s.id) AS rss_full_content_state,
-                (SELECT r.activation_generation FROM rss_full_content_sources r
-                 WHERE r.source_id = s.id) AS rss_full_content_generation,
-                (SELECT r.baseline_count FROM rss_full_content_sources r
-                 WHERE r.source_id = s.id) AS rss_full_content_baseline_count,
-                COALESCE((SELECT count(*) FROM rss_full_content_entries e
-                 JOIN rss_full_content_sources r ON r.source_id = e.source_id
-                 WHERE e.source_id = s.id AND e.activation_generation = r.activation_generation
+                CASE WHEN s.kind <> 'rss' THEN NULL
+                  WHEN s.config->>'content_mode' IS DISTINCT FROM 'full_new_items' THEN 'disabled'
+                  WHEN s.rss_baselined_at IS NULL THEN 'pending' ELSE 'active' END AS rss_full_content_state,
+                CASE WHEN s.kind='rss' THEN s.rss_generation END AS rss_full_content_generation,
+                (SELECT count(*)::int FROM projected e
+                 WHERE e.source_id=s.id AND e.activation_generation=s.rss_generation AND e.state='baseline') AS rss_full_content_baseline_count,
+                COALESCE((SELECT count(*) FROM projected e
+                 WHERE e.source_id = s.id AND e.activation_generation = s.rss_generation
                    AND e.state = 'pending'), 0) AS rss_full_content_pending_count,
-                COALESCE((SELECT count(*) FROM rss_full_content_entries e
-                 JOIN rss_full_content_sources r ON r.source_id = e.source_id
-                 WHERE e.source_id = s.id AND e.activation_generation = r.activation_generation
+                COALESCE((SELECT count(*) FROM projected e
+                 WHERE e.source_id = s.id AND e.activation_generation = s.rss_generation
                    AND e.state IN ('queued', 'hydrating')), 0) AS rss_full_content_queued_count,
-                COALESCE((SELECT count(*) FROM rss_full_content_entries e
-                 JOIN rss_full_content_sources r ON r.source_id = e.source_id
-                 WHERE e.source_id = s.id AND e.activation_generation = r.activation_generation
+                COALESCE((SELECT count(*) FROM projected e
+                 WHERE e.source_id = s.id AND e.activation_generation = s.rss_generation
                    AND e.state = 'retry_wait'), 0) AS rss_full_content_retrying_count,
-                COALESCE((SELECT count(*) FROM rss_full_content_entries e
-                 JOIN rss_full_content_sources r ON r.source_id = e.source_id
-                 WHERE e.source_id = s.id AND e.activation_generation = r.activation_generation
+                COALESCE((SELECT count(*) FROM projected e
+                 WHERE e.source_id = s.id AND e.activation_generation = s.rss_generation
                    AND e.state = 'complete'), 0) AS rss_full_content_complete_count,
-                COALESCE((SELECT count(*) FROM rss_full_content_entries e
-                 JOIN rss_full_content_sources r ON r.source_id = e.source_id
-                 WHERE e.source_id = s.id AND e.activation_generation = r.activation_generation
-                   AND e.state = 'terminal'), 0) AS rss_full_content_terminal_count
-         FROM sources s WHERE s.kb_id = $1 ORDER BY s.created_at",
+                COALESCE((SELECT count(*) FROM projected e
+                 WHERE e.source_id = s.id AND e.activation_generation = s.rss_generation
+                   AND e.state IN ('terminal','deleted','superseded')), 0) AS rss_full_content_terminal_count
+         FROM sources s WHERE s.kb_id = $1 ORDER BY s.created_at", crate::rss_full_content::ENTRY_SELECT),
     )
     .bind(kb_id)
     .bind(SOURCE_SECRET_KEYS)
@@ -288,8 +283,6 @@ pub async fn update(
 
     if (!old_full && new_full) || feed_url_changed {
         crate::rss_full_content::enable_source(&mut tx, id).await?;
-    } else if old_full && !new_full {
-        crate::rss_full_content::disable_source(&mut tx, id).await?;
     }
     tx.commit().await?;
     opened(source)

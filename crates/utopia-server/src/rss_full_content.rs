@@ -1,10 +1,10 @@
-use dom_smoothie::{Readability, ReadabilityError};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 use url::Url;
+use utopia_ingest::html::{self, HtmlError};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum ContentError {
@@ -34,8 +34,6 @@ pub(crate) enum ContentError {
     HttpStatus { retryable: bool },
     #[error("HTML conversion failed: {0}")]
     Conversion(String),
-    #[error("article extraction failed: {0}")]
-    Extraction(String),
     #[error("article page is a challenge or consent shell")]
     ChallengePage,
     #[error("article page requires unsupported video or player content")]
@@ -65,7 +63,6 @@ impl ContentError {
             Self::HttpStatus { retryable: true } => "http_retryable",
             Self::HttpStatus { retryable: false } => "http_denied",
             Self::Conversion(_) => "conversion_failed",
-            Self::Extraction(_) => "conversion_failed",
             Self::ChallengePage => "challenge_page",
             Self::VideoRequired => "video_required",
             Self::NonSubstantive => "non_substantive",
@@ -160,61 +157,15 @@ pub(crate) async fn hydrate_entry(
         .await?
         .ok_or_else(|| anyhow::anyhow!("RSS hydration entry was deleted"))?;
     if entry.source_id != source_id {
-        let _ = utopia_store::rss_full_content::mark_terminal(
-            &state.pool,
-            entry_id,
-            hydration_job_id,
-            "source_mismatch",
-            "hydration job source does not match ledger source",
-        )
-        .await;
-        state.emit_source(source_id);
-        return Ok(());
+        return Err(anyhow::Error::new(utopia_core::Terminal).context("source_mismatch"));
     }
-    if matches!(entry.state.as_str(), "complete" | "terminal") {
-        return Ok(());
-    }
-
     let source = utopia_store::sources::get(&state.pool, source_id).await?;
-    let activation = utopia_store::rss_full_content::get_activation(&state.pool, source_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("RSS full-content activation is missing"))?;
-    let full_mode = utopia_store::sources::rss_full_content_enabled(&source.kind, &source.config)?;
-    if !full_mode
-        || activation.activation_state != "active"
-        || activation.activation_generation != entry.activation_generation
-    {
-        utopia_store::rss_full_content::retire_stale_claim(
-            &state.pool,
-            entry_id,
-            hydration_job_id,
-            source_id,
-            entry.activation_generation,
-        )
-        .await?;
-        state.emit_source(source.kb_id);
-        return Ok(());
-    }
-
     let Some(attempt) =
-        utopia_store::rss_full_content::mark_hydrating(&state.pool, entry_id, hydration_job_id)
+        utopia_store::rss_full_content::current_attempt(&state.pool, entry_id, hydration_job_id)
             .await?
     else {
-        // The claim may have been superseded between the read above and the
-        // state transition. Retiring only the matching job keeps a newer claim
-        // untouched.
-        utopia_store::rss_full_content::retire_stale_claim(
-            &state.pool,
-            entry_id,
-            hydration_job_id,
-            source_id,
-            entry.activation_generation,
-        )
-        .await?;
-        state.emit_source(source.kb_id);
         return Ok(());
     };
-    let _ = attempt;
     state.emit_source(source.kb_id);
 
     let result = hydrate_content(&entry).await;
@@ -299,16 +250,7 @@ async fn hydrate_content(
     let markdown = if page.content_type == "text/markdown" {
         normalize_markdown(&page.body)?
     } else {
-        match extract_article_markdown(&page.body, page.final_url.as_str()) {
-            Ok(markdown) => markdown,
-            Err(ContentError::Extraction(_) | ContentError::Conversion(_)) => {
-                // Readability is preferred, but a bounded raw page can still be
-                // a valid article. Reuse the same converter and linked-page
-                // quality gate rather than silently losing usable content.
-                markdown_from_html(&page.body)?
-            }
-            Err(error) => return Err(error),
-        }
+        extract_article_markdown(&page.body, page.final_url.as_str())?
     };
     accept_linked_markdown(markdown, &entry.summary, Some(page.final_url.to_string()))
 }
@@ -352,33 +294,10 @@ async fn handle_hydration_failure(
         .map(|error| (error.code(), error.is_retryable()))
         .unwrap_or(("ingest_failed", true));
     let terminal = !retryable || attempt >= HYDRATION_ATTEMPTS;
-    let detail = if terminal {
-        "full-content acquisition reached a terminal outcome"
-    } else {
-        "full-content acquisition will be retried"
-    };
-    let transitioned = if terminal {
-        utopia_store::rss_full_content::mark_terminal(
-            pool,
-            entry_id,
-            hydration_job_id,
-            code,
-            detail,
-        )
+    if utopia_store::rss_full_content::current_attempt(pool, entry_id, hydration_job_id)
         .await?
-    } else {
-        utopia_store::rss_full_content::mark_retry_wait(
-            pool,
-            entry_id,
-            hydration_job_id,
-            code,
-            detail,
-        )
-        .await?
-    };
-    if !transitioned {
-        // The source generation or claim was superseded. Do not turn a stale
-        // worker into a retry of a newer job.
+        .is_none()
+    {
         return Ok(());
     }
     if terminal {
@@ -607,33 +526,25 @@ async fn read_page_response(
     })
 }
 
-/// Feed bodies are already scoped to one entry, so normalize them directly
-/// instead of running article readability over a fragment.
-pub(crate) fn normalize_feed_html(html: &str) -> Result<String, ContentError> {
-    markdown_from_html(html)
-}
-
-pub(crate) fn extract_article_html(html: &str, url: &str) -> Result<String, ContentError> {
-    let mut readability =
-        Readability::new(html, Some(url), None).map_err(|_: ReadabilityError| {
-            ContentError::Extraction("readability setup failed".into())
-        })?;
-    let article = readability.parse().map_err(|_: ReadabilityError| {
-        ContentError::Extraction("readability parse failed".into())
-    })?;
-    Ok(article.content.to_string())
-}
-
-pub(crate) fn extract_article_markdown(html: &str, url: &str) -> Result<String, ContentError> {
-    let article_html = extract_article_html(html, url)?;
-    if looks_like_challenge_html(&article_html) {
-        return Err(ContentError::ChallengePage);
+impl From<HtmlError> for ContentError {
+    fn from(error: HtmlError) -> Self {
+        match error {
+            HtmlError::Interstitial => Self::ChallengePage,
+            HtmlError::Conversion(detail) => Self::Conversion(detail),
+        }
     }
-    markdown_from_html(&article_html)
+}
+
+pub(crate) fn normalize_feed_html(raw: &str) -> Result<String, ContentError> {
+    html::fragment_to_markdown(raw).map_err(Into::into)
+}
+
+pub(crate) fn extract_article_markdown(raw: &str, url: &str) -> Result<String, ContentError> {
+    html::page_to_markdown(raw, Some(url)).map_err(Into::into)
 }
 
 pub(crate) fn normalize_markdown(markdown: &str) -> Result<String, ContentError> {
-    let markdown = sanitize_markdown_links(&post_process(markdown));
+    let markdown = html::normalize_markdown(markdown)?;
     if markdown.is_empty() {
         return Err(ContentError::NonSubstantive);
     }
@@ -702,27 +613,6 @@ fn looks_like_challenge_shell(lowered: &str) -> bool {
         && (lowered.contains("email") || lowered.contains("username")))
         || lowered.contains("<form");
     structural_hits >= 2 || (structural_hits >= 1 && has_auth_fields)
-}
-
-fn looks_like_challenge_html(html: &str) -> bool {
-    let lowered = html.to_ascii_lowercase();
-    let auth_form = lowered.contains("<form")
-        && (lowered.contains("password")
-            || lowered.contains("type=\"email\"")
-            || lowered.contains("type='email'"));
-    let player_shell = [
-        "jwplayer",
-        "brightcove",
-        "data-player",
-        "<video",
-        "youtube.com/embed",
-        "player.vimeo.com",
-    ]
-    .iter()
-    .filter(|marker| lowered.contains(**marker))
-    .count()
-        >= 2;
-    auth_form || player_shell
 }
 
 pub(crate) fn quality_check(
@@ -867,105 +757,6 @@ fn is_public_ip(ip: IpAddr) -> bool {
     }
 }
 
-fn markdown_from_html(html: &str) -> Result<String, ContentError> {
-    let markdown = htmd::HtmlToMarkdown::builder()
-        .skip_tags(vec![
-            "script", "style", "iframe", "object", "embed", "img", "svg", "math",
-        ])
-        .scripting_enabled(false)
-        .build()
-        .convert(html)
-        .map_err(|e| ContentError::Conversion(e.to_string()))?;
-    Ok(sanitize_markdown_links(&post_process(&markdown)))
-}
-
-fn post_process(markdown: &str) -> String {
-    let mut result = String::with_capacity(markdown.len());
-    let mut newlines = 0;
-    for ch in markdown.chars() {
-        if ch == '\n' {
-            newlines += 1;
-            if newlines <= 3 {
-                result.push(ch);
-            }
-        } else {
-            newlines = 0;
-            result.push(ch);
-        }
-    }
-    result.trim().to_string()
-}
-
-fn sanitize_markdown_links(markdown: &str) -> String {
-    let mut result = String::with_capacity(markdown.len());
-    let bytes = markdown.as_bytes();
-    let mut cursor = 0;
-    while cursor < bytes.len() {
-        let Some(relative_start) = markdown[cursor..].find('[') else {
-            result.push_str(&markdown[cursor..]);
-            break;
-        };
-        let start = cursor + relative_start;
-        result.push_str(&markdown[cursor..start]);
-        if start > 0 && bytes[start - 1] == b'!' {
-            result.push('[');
-            cursor = start + 1;
-            continue;
-        }
-        let Some(relative_close_label) = markdown[start + 1..].find("](") else {
-            result.push('[');
-            cursor = start + 1;
-            continue;
-        };
-        let close_label = start + 1 + relative_close_label;
-        let Some(close_link) = find_unescaped_byte(bytes, close_label + 2, b')') else {
-            result.push('[');
-            cursor = start + 1;
-            continue;
-        };
-        let destination = &markdown[close_label + 2..close_link];
-        if !is_unsafe_markdown_destination(destination) {
-            result.push_str(&markdown[start..=close_link]);
-        } else {
-            result.push_str(&markdown[start + 1..close_label]);
-        }
-        cursor = close_link + 1;
-    }
-    result
-}
-
-fn find_unescaped_byte(bytes: &[u8], start: usize, wanted: u8) -> Option<usize> {
-    let mut escaped = false;
-    for (offset, byte) in bytes.iter().enumerate().skip(start) {
-        if escaped {
-            escaped = false;
-        } else if *byte == b'\\' {
-            escaped = true;
-        } else if *byte == wanted {
-            return Some(offset);
-        }
-    }
-    None
-}
-
-fn is_unsafe_markdown_destination(destination: &str) -> bool {
-    let destination = destination
-        .trim()
-        .trim_start_matches('<')
-        .trim_end_matches('>')
-        .trim();
-    let decoded = percent_encoding::percent_decode_str(destination).decode_utf8_lossy();
-    let decoded =
-        decoded.trim_start_matches(|ch: char| ch.is_ascii_control() || ch.is_ascii_whitespace());
-    let Some((scheme, _)) = decoded.split_once(':') else {
-        return false;
-    };
-    matches!(
-        scheme.to_ascii_lowercase().as_str(),
-        "javascript" | "vbscript" | "data" | "file" | "blob"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,6 +765,49 @@ mod tests {
     use uuid::Uuid;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn generic_html_and_rss_share_article_body_with_base_dependent_links() {
+        let body = "Substantive reporting with detailed supporting evidence. ".repeat(80);
+        let raw = format!("<html><head><title>Story</title></head><body><nav>Navigation noise</nav><article><h1>Story</h1><p>{body}</p><p><a href='related'>Related reporting</a></p></article><footer>Footer noise</footer></body></html>");
+        let generic = utopia_ingest::parse("page.html", raw.as_bytes())
+            .unwrap()
+            .text;
+        let rss = extract_article_markdown(&raw, "https://example.com/redirected/story").unwrap();
+        for markdown in [&generic, &rss] {
+            assert!(markdown.contains(body.trim()));
+            assert!(markdown.contains("Story"));
+            assert!(!markdown.contains("Navigation noise"));
+            assert!(!markdown.contains("Footer noise"));
+        }
+        assert!(rss.contains("https://example.com/redirected/related"));
+        let body_semantics = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            body_semantics(&generic),
+            body_semantics(&rss.replace("https://example.com/redirected/related", "related"))
+        );
+    }
+
+    #[test]
+    fn direct_markdown_uses_shared_normalization() {
+        let raw = "  # Story\n\n\n\n[bad](%6Aavascript:evil) [safe](https://example.com)  ";
+        assert_eq!(
+            normalize_markdown(raw).unwrap(),
+            html::normalize_markdown(raw).unwrap()
+        );
+        assert!(!normalize_markdown(raw).unwrap().contains("%6Aavascript"));
+        assert_eq!(normalize_markdown("  "), Err(ContentError::NonSubstantive));
+    }
+
+    #[test]
+    fn html_interstitial_cannot_be_lost_by_readability() {
+        let body = "Detailed reporting with plenty of supporting evidence. ".repeat(80);
+        let html = format!("<form><input type='password'></form><article><p>{body}</p></article>");
+        assert_eq!(
+            extract_article_markdown(&html, "https://example.com/story"),
+            Err(ContentError::ChallengePage)
+        );
+    }
 
     #[test]
     fn feed_html_is_normalized_to_markdown() {
@@ -1233,9 +1067,6 @@ mod tests {
             state: "hydrating".into(),
             hydration_job_id: None,
             attempt_count: 1,
-            content_source: None,
-            final_url: None,
-            content_sha256: None,
             document_id: None,
             error_code: None,
             error_detail: None,

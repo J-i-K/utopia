@@ -338,7 +338,6 @@ pub async fn full_content_entries(
                 "attempt_count": entry.attempt_count,
                 "error_code": entry.error_code,
                 "error_detail": entry.error_detail,
-                "content_source": entry.content_source,
                 "document_id": entry.document_id,
                 "completed_at": entry.completed_at,
             })

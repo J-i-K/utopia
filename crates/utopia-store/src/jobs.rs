@@ -123,7 +123,7 @@ pub async fn requeue_failed(pool: &PgPool, scope: RequeueScope<'_>) -> AppResult
     let sql = format!(
         "UPDATE jobs j
             SET status = 'queued', attempts = 0, run_at = now(), updated_at = now()
-          WHERE j.status = 'failed'
+          WHERE j.status = 'failed' AND j.kind <> 'hydrate_rss_entry'
             AND ($1::text IS NULL OR j.kind = $1)
             AND ($2::timestamptz IS NULL OR j.updated_at >= $2)
             AND ($3::uuid IS NULL OR {})",
@@ -135,7 +135,78 @@ pub async fn requeue_failed(pool: &PgPool, scope: RequeueScope<'_>) -> AppResult
         .bind(scope.kb_id)
         .execute(pool)
         .await?;
-    Ok(res.rows_affected())
+    let mut count = res.rows_affected();
+    if scope.kind.is_some_and(|kind| kind != "hydrate_rss_entry") {
+        return Ok(count);
+    }
+    // RSS retries share the same source lock and capacity as first admission.
+    // Never reinstate a superseded job simply because it still exists in history.
+    let sources: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT e.source_id FROM rss_full_content_entries e
+         JOIN jobs j ON j.id = e.current_job_id
+         JOIN sources s ON s.id = e.source_id
+         WHERE j.status = 'failed' AND j.kind = 'hydrate_rss_entry'
+           AND ($1::uuid IS NULL OR s.kb_id = $1)
+           AND ($2::timestamptz IS NULL OR j.updated_at >= $2)
+         ORDER BY e.source_id",
+    )
+    .bind(scope.kb_id)
+    .bind(scope.failed_since)
+    .fetch_all(pool)
+    .await?;
+    for source_id in sources {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SELECT id FROM sources WHERE id = $1 FOR UPDATE")
+            .bind(source_id)
+            .execute(&mut *tx)
+            .await?;
+        let generation: Option<i32> = sqlx::query_scalar(
+            "SELECT rss_generation FROM sources WHERE id=$1
+             AND rss_baselined_at IS NOT NULL AND config->>'content_mode'='full_new_items'",
+        )
+        .bind(source_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(generation) = generation else {
+            continue;
+        };
+        let live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM rss_full_content_entries e
+             JOIN jobs j ON j.id = e.current_job_id
+             WHERE e.source_id = $1 AND e.activation_generation = $2
+               AND j.status IN ('queued', 'running')",
+        )
+        .bind(source_id)
+        .bind(generation)
+        .fetch_one(&mut *tx)
+        .await?;
+        let capacity = (25 - live).max(0);
+        let jobs: Vec<i64> = sqlx::query_scalar(
+            "SELECT j.id FROM rss_full_content_entries e
+             JOIN jobs j ON j.id = e.current_job_id
+             WHERE e.source_id = $1 AND e.activation_generation = $2
+               AND j.kind = 'hydrate_rss_entry' AND j.status = 'failed'
+               AND ($3::timestamptz IS NULL OR j.updated_at >= $3)
+               AND j.payload ? 'observed_at'
+               AND NOT EXISTS (
+                 SELECT 1 FROM document_deletions dd JOIN documents d ON d.id = dd.document_id
+                 WHERE d.source_id = e.source_id AND dd.external_key = e.external_key
+                   AND GREATEST(dd.created_at, d.purged_at) >= (j.payload->>'observed_at')::timestamptz)
+             ORDER BY j.id LIMIT $4 FOR UPDATE OF e, j",
+        ).bind(source_id).bind(generation).bind(scope.failed_since).bind(capacity)
+            .fetch_all(&mut *tx).await?;
+        count += sqlx::query(
+            "UPDATE jobs SET status = 'queued', attempts = 0, last_error = NULL,
+             locked_at = NULL, run_at = now(), updated_at = now()
+             WHERE id = ANY($1) AND status = 'failed'",
+        )
+        .bind(&jobs)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+    }
+    Ok(count)
 }
 
 /// 范围内 failed 的条数——设置页那一行「N 个失败任务」

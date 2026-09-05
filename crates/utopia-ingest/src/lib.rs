@@ -1,7 +1,78 @@
 //! utopia-ingest: 解析矩阵 + 分块。
 //! 原则：文本层 Rust 原生解决（快、零依赖）；扫描件/复杂版式后续走 docling sidecar。
 
+#[cfg(test)]
+mod html_tests {
+    #[test]
+    fn html_fragment_preserves_scoped_content() {
+        let raw = "<nav>Scoped feed navigation</nav><p>Short <em>entry</em>.</p>";
+        let markdown = super::html::fragment_to_markdown(raw).unwrap();
+        assert!(markdown.contains("Scoped feed navigation"));
+        assert!(markdown.contains("*entry*"));
+    }
+    #[test]
+    fn html_readability_failure_uses_raw_conversion() {
+        let raw = "<p>Short <strong>fallback</strong> body.</p>";
+        // An invalid base URL deterministically fails Readability setup.
+        assert!(dom_smoothie::Readability::new(raw, Some("not a URL"), None).is_err());
+        assert_eq!(
+            super::html::page_to_markdown(raw, Some("not a URL")).unwrap(),
+            super::html::fragment_to_markdown(raw).unwrap()
+        );
+    }
+    #[test]
+    fn html_empty_output_remains_parse_error() {
+        assert!(super::parse("empty.html", b"<html><body></body></html>").is_err());
+    }
+    #[test]
+    fn html_interstitial_errors_are_stable_for_pages_and_fragments() {
+        for raw in [
+            "<form><input type='email'></form>",
+            "<video data-player='player'></video>",
+        ] {
+            assert_eq!(
+                super::html::page_to_markdown(raw, Some("not a URL")),
+                Err(super::html::HtmlError::Interstitial)
+            );
+            assert_eq!(
+                super::html::fragment_to_markdown(raw),
+                Err(super::html::HtmlError::Interstitial)
+            );
+        }
+    }
+    #[test]
+    fn html_markdown_normalization_removes_unsafe_destinations() {
+        let normalized = super::html::normalize_markdown("  [bad](javascript:evil) [encoded](%64ata:text/plain,evil) [safe](https://example.com)\n\n\n\n  ").unwrap();
+        assert_eq!(normalized, "bad encoded [safe](https://example.com)");
+    }
+    #[test]
+    fn html_interstitial_is_not_raw_fallback() {
+        let html = "<form><input type='password'></form><p>Readable shell</p>";
+        assert!(super::parse("page.html", html.as_bytes()).is_err());
+    }
+    #[test]
+    fn html_page_removes_chrome() {
+        let body = "Substantive reporting with detailed evidence. ".repeat(80);
+        let html = format!("<html><head><title>Story</title></head><body><nav>Navigation noise</nav><article><h1>Story</h1><p>{body}</p></article><footer>Footer noise</footer></body></html>");
+        let parsed = super::parse("page.html", html.as_bytes()).unwrap();
+        assert!(parsed.text.contains("Story"));
+        assert!(parsed.text.contains(body.trim()));
+        assert!(!parsed.text.contains("Navigation noise"), "{}", parsed.text);
+        assert!(!parsed.text.contains("Footer noise"));
+    }
+    #[test]
+    fn html_preserves_markdown_structure() {
+        let parsed = super::parse(
+            "page.html",
+            b"<article><h1>Story</h1><p>Useful <strong>body</strong>.</p></article>",
+        )
+        .unwrap();
+        assert!(parsed.text.contains("**body**"), "{}", parsed.text);
+    }
+}
+
 mod chunker;
+pub mod html;
 pub mod ontology_rdf;
 mod parsers;
 
@@ -29,7 +100,7 @@ pub fn parse(filename: &str, bytes: &[u8]) -> anyhow::Result<ParsedDoc> {
         ("docx", _) | (_, "docx") => parsers::docx(bytes)?,
         ("xlsx", _) | (_, "xlsx") | (_, "xls") | (_, "ods") => parsers::spreadsheet(bytes)?,
         ("pptx", _) | (_, "pptx") => parsers::pptx(bytes)?,
-        (_, "html") | (_, "htm") => parsers::html(bytes),
+        (_, "html") | (_, "htm") => parsers::html(bytes)?,
         (_, "csv") | (_, "tsv") => parsers::csv_text(bytes, ext == "tsv")?,
         // md/json/yaml/xml/log/txt 及一切未识别格式：按文本解码（编码探测覆盖 GBK 等）
         _ => parsers::plain_text(bytes),

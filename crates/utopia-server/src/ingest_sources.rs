@@ -6,7 +6,6 @@
 
 use crate::state::AppState;
 use chrono::{DateTime, Utc};
-use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use utopia_core::models::Source;
 use utopia_core::models::SourceKind;
@@ -21,7 +20,7 @@ const RSS_HYDRATION_ATTEMPTS: i32 = 5;
 /// 抓取用的 User-Agent。reqwest 默认一个都不发，而维基百科明确拒绝匿名请求
 /// （403），Cloudflare 前置的站点也普遍如此——URL 与 RSS 两类来源因此对一大批
 /// 真实网站直接失效。自报家门也是爬虫礼节：站方能认出我们、能联系到我们。
-const UA: &str = concat!(
+pub(crate) const UA: &str = concat!(
     "Utopia/",
     env!("CARGO_PKG_VERSION"),
     " (+https://utopia.bi; self-hosted knowledge platform)"
@@ -267,7 +266,31 @@ pub async fn ingest_item_with_outcome(
     }
 
     if let Some(doc) = existing {
+        // Ordinary source reappearance retains upstream restore semantics,
+        // including search and derivation repair, before comparing content.
+        let revived = doc.deleted_at.is_some();
+        if revived {
+            let restored = utopia_store::documents::restore(&state.pool, kb_id, doc.id).await?;
+            crate::api::documents_routes::reindex(state, &restored).await?;
+            crate::api::documents_routes::settle_derivations(state, kb_id).await?;
+            let _ = utopia_store::audit::record_opt(
+                &state.pool,
+                Some(kb_id),
+                None,
+                "document.restored",
+                "document",
+                Some(doc.id),
+                serde_json::json!({"filename":restored.filename,"via":"sync"}),
+            )
+            .await;
+        }
         if doc.sha256 == sha256 {
+            if revived {
+                state.emit_document(kb_id, doc.id);
+                return Ok(IngestOutcome {
+                    action: IngestAction::Updated,
+                });
+            }
             return Ok(IngestOutcome {
                 action: IngestAction::Unchanged,
             });
@@ -346,14 +369,10 @@ async fn sync_urls(state: &AppState, source: &Source) -> anyhow::Result<SyncStat
         anyhow::bail!("url source is missing config.urls (a list of page URLs)");
     }
 
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(UA)
-        .build()?;
     let mut stats = SyncStats::default();
     let mut last_err: Option<String> = None;
     for url in urls.iter().take(MAX_NEW_PER_SYNC) {
-        match fetch_page(&http, url).await {
+        match fetch_page(url).await {
             Ok((filename, mime, bytes)) => {
                 // 逻辑身份 = URL 本身：页面内容变了就原地替换（历史进版本表）
                 let action = ingest_item(
@@ -388,26 +407,27 @@ async fn sync_urls(state: &AppState, source: &Source) -> anyhow::Result<SyncStat
     Ok(stats)
 }
 
-async fn fetch_page(
-    http: &reqwest::Client,
-    url: &str,
-) -> anyhow::Result<(String, String, Vec<u8>)> {
-    let resp = http.get(url).send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("HTTP {}", resp.status());
+/// 抓一个页面。地址是这个库的人自己填的，所以内网放行（`Reach::Operator`），
+/// 但重定向不许把请求带进内网，响应体有上限（#330）。
+async fn fetch_page(url: &str) -> anyhow::Result<(String, String, Vec<u8>)> {
+    let page = crate::http_fetch::get(
+        url,
+        crate::http_fetch::Reach::Operator,
+        crate::http_fetch::Limits::default(),
+    )
+    .await?;
+    let mime = if page.mime == "application/octet-stream" {
+        "text/html".to_string()
+    } else {
+        page.mime
+    };
+    // 身份仍然是**配置里那个 URL**（同一个页面换了地址不该变成新文档），
+    // 但落到别处这件事值得留一行
+    if page.final_url.as_str() != url {
+        tracing::debug!(from = url, to = %page.final_url, "页面跟着重定向落在别处");
     }
-    let mime = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("text/html")
-        .split(';')
-        .next()
-        .unwrap_or("text/html")
-        .to_string();
-    let bytes = resp.bytes().await?.to_vec();
     let filename = filename_from_url(url, &mime);
-    Ok((filename, mime, bytes))
+    Ok((filename, mime, page.bytes))
 }
 
 fn filename_from_url(url: &str, mime: &str) -> String {
@@ -438,28 +458,6 @@ fn filename_from_url(url: &str, mime: &str) -> String {
     } else {
         slug
     }
-}
-
-async fn read_bounded_response(
-    response: reqwest::Response,
-    max_bytes: usize,
-) -> anyhow::Result<Vec<u8>> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > max_bytes as u64)
-    {
-        anyhow::bail!("response body exceeds configured bound");
-    }
-    let mut bytes = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if bytes.len().saturating_add(chunk.len()) > max_bytes {
-            anyhow::bail!("response body exceeds configured bound");
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
 }
 
 fn escape_html(value: &str) -> String {
@@ -537,22 +535,39 @@ fn has_usable_rss_content(feed_usable: bool, article_url: Option<&str>) -> bool 
     feed_usable || article_url.is_some_and(|url| !url.trim().is_empty())
 }
 
+#[cfg(test)]
+#[path = "rss_sync_contract_tests.rs"]
+mod rss_sync_contract_tests;
+
 async fn sync_rss(state: &AppState, source: &Source) -> anyhow::Result<SyncStats> {
     let feed_url = source.config["feed_url"]
         .as_str()
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("rss source is missing config.feed_url"))?;
     let content_mode = utopia_store::sources::rss_content_mode(&source.config)?;
+    let observation = if content_mode == utopia_store::sources::RSS_FULL_CONTENT_MODE {
+        Some(
+            utopia_store::rss_full_content::begin_feed_observation(
+                &state.pool,
+                source.id,
+                &source.config,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(UA)
-        .build()?;
-    let resp = http.get(feed_url).send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("HTTP {} fetching feed", resp.status());
-    }
-    let bytes = read_bounded_response(resp, MAX_FEED_BYTES).await?;
+    let feed_body = crate::http_fetch::get(
+        feed_url,
+        crate::http_fetch::Reach::Operator,
+        crate::http_fetch::Limits {
+            max_bytes: MAX_FEED_BYTES,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let bytes = feed_body.bytes;
     // feed-rs normally synthesizes missing entry IDs from link + title (or a
     // random UUID). Neither is an application-level stable identity. Leave
     // missing IDs empty so rss_entry_key can use only the stable article URL.
@@ -605,10 +620,7 @@ async fn sync_rss(state: &AppState, source: &Source) -> anyhow::Result<SyncStats
         })
         .collect();
 
-    if content_mode == utopia_store::sources::RSS_FULL_CONTENT_MODE {
-        let activation = utopia_store::rss_full_content::get_activation(&state.pool, source.id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("RSS full-content activation is missing"))?;
+    if let Some((activation, observed_at)) = observation {
         let entries: Vec<utopia_store::rss_full_content::NewEntry> = observations
             .iter()
             .map(|observation| utopia_store::rss_full_content::NewEntry {
@@ -642,11 +654,12 @@ async fn sync_rss(state: &AppState, source: &Source) -> anyhow::Result<SyncStats
             anyhow::bail!("RSS full-content activation is disabled");
         }
 
-        let discovered = utopia_store::rss_full_content::discover(
+        let discovered = utopia_store::rss_full_content::discover_observed(
             &state.pool,
             source.id,
             activation.activation_generation,
             &entries,
+            observed_at,
         )
         .await?;
         let queued = utopia_store::rss_full_content::claim_pending_and_enqueue(
@@ -737,10 +750,13 @@ async fn sync_github_issues(state: &AppState, source: &Source) -> anyhow::Result
         .as_bool()
         .unwrap_or(false);
 
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(UA)
-        .build()?;
+    // api.github.com 是固定的公网主机，所以按内容级的严格度收（`Reach::Content`）
+    let http = crate::http_fetch::client_for(
+        &reqwest::Url::parse("https://api.github.com/")?,
+        crate::http_fetch::Reach::Content,
+        crate::http_fetch::Limits::default(),
+    )
+    .await?;
     let base = format!("https://api.github.com/repos/{repo}");
 
     // 增量：GitHub 的 since 是"这之后更新过的"
@@ -827,10 +843,12 @@ async fn sync_jira_issues(state: &AppState, source: &Source) -> anyhow::Result<S
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(45))
-        .user_agent(UA)
-        .build()?;
+    let http = crate::http_fetch::client_for(
+        &reqwest::Url::parse(base_url).map_err(|e| anyhow::anyhow!("Invalid base_url: {e}"))?,
+        crate::http_fetch::Reach::Operator,
+        crate::http_fetch::Limits::default().with_overall(std::time::Duration::from_secs(45)),
+    )
+    .await?;
 
     let jql = crate::jira_issues::jql(project, source.last_sync_at);
     let (issues, total) = crate::jira_issues::fetch_all(&http, base_url, &jql, auth).await?;
@@ -901,20 +919,14 @@ async fn sync_custom(state: &AppState, source: &Source) -> anyhow::Result<SyncSt
         url.query_pairs_mut().append_pair("since", &t.to_rfc3339());
     }
 
-    // loopback 端点不走系统代理：代理对回环地址只会 502，本机服务必须直连
-    let loopback = url
-        .host_str()
-        .map(|h| {
-            h.eq_ignore_ascii_case("localhost") || h == "127.0.0.1" || h == "::1" || h == "[::1]"
-        })
-        .unwrap_or(false);
-    let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(UA);
-    if loopback {
-        builder = builder.no_proxy();
-    }
-    let http = builder.build()?;
+    // 端点是操作者自己填的，内网与回环都是正当目标；代理的取舍（回环走代理
+    // 只会 502）和地址校验一起收进 `client_for`（#330）
+    let http = crate::http_fetch::client_for(
+        &url,
+        crate::http_fetch::Reach::Operator,
+        crate::http_fetch::Limits::default(),
+    )
+    .await?;
     let mut req = http.get(url);
     if let Some(auth) = source.config["auth_header"]
         .as_str()
@@ -1068,9 +1080,12 @@ async fn sync_webdav(state: &AppState, source: &Source) -> anyhow::Result<SyncSt
         _ => None,
     };
 
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?;
+    let http = crate::http_fetch::client_for(
+        &reqwest::Url::parse(base).map_err(|e| anyhow::anyhow!("Invalid base_url: {e}"))?,
+        crate::http_fetch::Reach::Operator,
+        crate::http_fetch::Limits::default().with_overall(std::time::Duration::from_secs(60)),
+    )
+    .await?;
     let (files, truncated) = crate::webdav::fetch(&http, base, root, auth).await?;
     if truncated {
         tracing::warn!(base, root, "文件数到达单次上限，其余留给下一次同步");

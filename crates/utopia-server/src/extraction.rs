@@ -313,6 +313,7 @@ pub async fn extract_document(
 
 /// mention → 实体 id。同一文档内同名同类型直接复用（单文档语境里罕有同名不同人，
 /// 也把消解调用摊薄到每个名字一次）；跨文档歧义由 resolve_mention 的画像比对处理。
+#[allow(clippy::too_many_arguments)]
 async fn resolve(
     pool: &PgPool,
     kb_id: Uuid,
@@ -320,6 +321,8 @@ async fn resolve(
     type_id: Option<Uuid>,
     name: &str,
     ctx: Option<&[f32]>,
+    // 本次提及所在分块的原文：画像分不开同名候选时的事实旁证（#331）
+    text: Option<&str>,
     doc_cache: &mut HashMap<(Option<Uuid>, String), Uuid>,
     needs_adjudication: &mut bool,
 ) -> anyhow::Result<Uuid> {
@@ -330,25 +333,39 @@ async fn resolve(
     if let Some(id) = doc_cache.get(&key) {
         return Ok(*id);
     }
-    let id = resolve_uncached(pool, kb_id, type_id, name, ctx, &[], needs_adjudication).await?;
+    let id = resolve_uncached(
+        pool,
+        kb_id,
+        type_id,
+        name,
+        ctx,
+        text,
+        &[],
+        needs_adjudication,
+    )
+    .await?;
     doc_cache.insert(key, id);
     Ok(id)
 }
 
 /// Resolve without the document's name cache. Handles use this path so two identities claimed
 /// separately in one response cannot collapse before their fact refs are bound.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_uncached(
     pool: &PgPool,
     kb_id: Uuid,
     type_id: Option<Uuid>,
     name: &str,
     ctx: Option<&[f32]>,
+    text: Option<&str>,
     exclude: &[Uuid],
     needs_adjudication: &mut bool,
 ) -> anyhow::Result<Uuid> {
     let r =
-        utopia_store::resolution::resolve_mention(pool, kb_id, type_id, name, ctx, exclude).await?;
-    // 疑似重复对（同名灰区 / 类型漂移）入审核队列，攒批裁决任务收尾统一触发
+        utopia_store::resolution::resolve_mention(pool, kb_id, type_id, name, ctx, text, exclude)
+            .await?;
+    // 疑似重复对（画像灰区 / 类型漂移 / 同名并列）入审核队列。多数走批量裁决器，
+    // 同名并列（`ReviewStage::Human`）分不出谁是谁，只能等人裁——它自己带着 stage。
     for review in &r.reviews {
         utopia_store::resolution::create_review(
             pool,
@@ -357,10 +374,13 @@ async fn resolve_uncached(
             review.other_id,
             review.score,
             &review.reason,
-            utopia_store::resolution::ReviewStage::Adjudicating,
+            review.stage,
         )
         .await?;
-        *needs_adjudication = true;
+        // 只有批量可裁的才触发裁决任务；纯人工审核对不该唤醒裁决器
+        if review.stage == utopia_store::resolution::ReviewStage::Adjudicating {
+            *needs_adjudication = true;
+        }
     }
     Ok(r.entity_id)
 }
@@ -435,6 +455,7 @@ async fn resolve_handle(
     type_id: Option<Uuid>,
     name: &str,
     ctx: Option<&[f32]>,
+    text: Option<&str>,
     response_claims: &mut HashMap<String, Vec<Uuid>>,
     handled_by_name: &mut HashMap<String, Vec<Uuid>>,
     ambiguous_bare_cache: &mut HashMap<String, Uuid>,
@@ -473,6 +494,7 @@ async fn resolve_handle(
                 type_id,
                 name,
                 ctx,
+                text,
                 &excluded,
                 needs_adjudication,
             )
@@ -504,6 +526,7 @@ async fn resolve_bare(
     type_id: Option<Uuid>,
     name: &str,
     ctx: Option<&[f32]>,
+    text: Option<&str>,
     doc_cache: &mut HashMap<(Option<Uuid>, String), Uuid>,
     handled_by_name: &HashMap<String, Vec<Uuid>>,
     ambiguous_bare_cache: &mut HashMap<String, Uuid>,
@@ -522,6 +545,7 @@ async fn resolve_bare(
             type_id,
             name,
             ctx,
+            text,
             doc_cache,
             needs_adjudication,
         )
@@ -534,7 +558,17 @@ async fn resolve_bare(
     // The text supplies no evidence for choosing among the handled namesakes. Preserve the
     // fact on one document-scoped provisional entity and expose every possible identity link
     // to a person. Subsequent bare mentions in this document reuse this provisional entity.
-    let id = resolve_uncached(pool, kb_id, type_id, name, ctx, &claims, needs_adjudication).await?;
+    let id = resolve_uncached(
+        pool,
+        kb_id,
+        type_id,
+        name,
+        ctx,
+        text,
+        &claims,
+        needs_adjudication,
+    )
+    .await?;
     if create_namesake_reviews(pool, kb_id, id, &claims).await? {
         *human_reviews_found = true;
     }
@@ -886,6 +920,7 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                     type_id,
                     name,
                     ctx,
+                    Some(&chunk.text),
                     &mut response_claims,
                     &mut handled_by_name,
                     &mut ambiguous_bare_cache,
@@ -902,6 +937,7 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                     type_id,
                     name,
                     ctx,
+                    Some(&chunk.text),
                     &mut doc_cache,
                     &handled_by_name,
                     &mut ambiguous_bare_cache,
@@ -1016,6 +1052,7 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                                     type_id,
                                     subject_name,
                                     ctx,
+                                    Some(&chunk.text),
                                     &mut doc_cache,
                                     &handled_by_name,
                                     &mut ambiguous_bare_cache,
@@ -1375,6 +1412,7 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                                 None,
                                 f.subject.trim(),
                                 ctx,
+                                Some(&chunk.text),
                                 &mut doc_cache,
                                 &handled_by_name,
                                 &mut ambiguous_bare_cache,
@@ -1414,6 +1452,7 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                             None,
                             object_name,
                             ctx,
+                            Some(&chunk.text),
                             &mut doc_cache,
                             &handled_by_name,
                             &mut ambiguous_bare_cache,
@@ -2215,6 +2254,7 @@ mod tests {
                 Some(person),
                 "Alice",
                 None,
+                None,
                 &mut legacy_cache,
                 &mut legacy_needs_adjudication,
             )
@@ -2224,6 +2264,7 @@ mod tests {
                 kb,
                 Some(person),
                 "Alice",
+                None,
                 None,
                 &mut legacy_cache,
                 &mut legacy_needs_adjudication,
@@ -2241,6 +2282,7 @@ mod tests {
                 Some(person),
                 "Zhang Wei",
                 None,
+                None,
                 &mut response_claims,
                 &mut document_claims,
                 &mut bare_cache,
@@ -2253,6 +2295,7 @@ mod tests {
                 kb,
                 Some(person),
                 "Zhang Wei",
+                None,
                 None,
                 &mut response_claims,
                 &mut document_claims,
@@ -2352,6 +2395,7 @@ mod tests {
                 Some(person),
                 "Zhang Wei",
                 None,
+                None,
                 &mut doc_cache,
                 &document_claims,
                 &mut bare_cache,
@@ -2374,6 +2418,7 @@ mod tests {
                 kb,
                 None,
                 "Zhang Wei",
+                None,
                 None,
                 &mut doc_cache,
                 &document_claims,
@@ -2415,6 +2460,7 @@ mod tests {
                 Some(person),
                 "Zhang Wei",
                 None,
+                None,
                 &mut later_response_claims,
                 &mut document_claims,
                 &mut bare_cache,
@@ -2434,6 +2480,108 @@ mod tests {
                 utopia_store::resolution::pending_adjudications(&pool, kb, 10)
                     .await?
                     .is_empty()
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+
+        let _ = sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org)
+            .execute(&pool)
+            .await;
+        run
+    }
+
+    /// #270：跨文档的裸 mention 同名并列——不靠 handle，靠画像相似度。库里已有两个
+    /// 「张伟」，画像质心一模一样（同一 chunk 播的种）。新 mention 对两人打出同一个分。
+    /// 旧路径在最高分 ≥ SIM_ATTACH 时静默 attach 到先遇到的那个；修好之后 `resolve`
+    /// 走的这条路要：新建第三个实体、两条**人工**审核对、且绝不唤醒 LLM 裁决器
+    /// （否则两条几乎相同的画像会被自动并掉，正是要防的）。
+    #[tokio::test]
+    async fn a_profile_tie_across_documents_files_human_reviews_not_an_attach() -> anyhow::Result<()>
+    {
+        let Some(url) = utopia_store::test_db::url() else {
+            return Ok(());
+        };
+        let pool = sqlx::PgPool::connect(&url).await?;
+        let (org, ws, kb) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        sqlx::query("INSERT INTO organizations (id, name) VALUES ($1, 'profile-tie-test')")
+            .bind(org)
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO workspaces (id, org_id, name) VALUES ($1, $2, 'profile-tie-test')",
+        )
+        .bind(ws)
+        .bind(org)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO knowledge_bases (id, workspace_id, name) VALUES ($1, $2, 'profile-tie-test')",
+        )
+        .bind(kb)
+        .bind(ws)
+        .execute(&pool)
+        .await?;
+        let person = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO entity_types (id, kb_id, key, label) VALUES ($1, $2, 'person', 'Person')",
+        )
+        .bind(person)
+        .bind(kb)
+        .execute(&pool)
+        .await?;
+
+        let run = async {
+            // 两个同名的人，画像向量完全相同
+            let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+            for id in [a, b] {
+                sqlx::query(
+                    "INSERT INTO entities
+                        (id, kb_id, type_id, canonical_name, profile_embedding, profile_n)
+                     VALUES ($1, $2, $3, 'Zhang Wei', '[1,0,0]'::vector, 1)",
+                )
+                .bind(id)
+                .bind(kb)
+                .bind(person)
+                .execute(&pool)
+                .await?;
+            }
+
+            // 与两人画像都一致的上下文：打出的余弦相同 → 分不开
+            let ctx: Vec<f32> = vec![1.0, 0.0, 0.0];
+            let mut doc_cache = HashMap::new();
+            let mut needs_adjudication = false;
+            let c = super::resolve(
+                &pool,
+                kb,
+                Some(person),
+                "Zhang Wei",
+                Some(&ctx),
+                None,
+                &mut doc_cache,
+                &mut needs_adjudication,
+            )
+            .await?;
+
+            assert_ne!(c, a, "画像并列不该 attach 到 A——那是候选顺序掷出的硬币");
+            assert_ne!(c, b, "画像并列不该 attach 到 B——那是候选顺序掷出的硬币");
+            assert!(
+                !needs_adjudication,
+                "同名并列只能等人裁，绝不该唤醒 LLM 裁决器"
+            );
+
+            let reviews = utopia_store::resolution::list_reviews(&pool, kb, 10, 0).await?;
+            assert_eq!(reviews.len(), 2, "对 A、对 B 各一条审核对");
+            assert!(
+                reviews.iter().all(|review| review.stage == "human"),
+                "同名并列的审核对必须是人工阶段"
+            );
+            assert!(
+                utopia_store::resolution::pending_adjudications(&pool, kb, 10)
+                    .await?
+                    .is_empty(),
+                "人工审核对绝不能落进批量裁决队列，否则又会被自动并掉"
             );
             Ok::<_, anyhow::Error>(())
         }

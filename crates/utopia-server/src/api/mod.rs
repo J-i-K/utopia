@@ -5,6 +5,7 @@ mod chat;
 mod datasource_routes;
 pub(crate) mod documents_routes;
 mod events_routes;
+mod export_routes;
 mod graph_routes;
 mod jobs_routes;
 mod kbs;
@@ -89,6 +90,9 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
         .route("/kbs/{id}/readiness", get(kbs::readiness))
         .route("/kbs/{id}/members", get(kbs::members))
         .route("/kbs/{id}/audit", get(kbs::audit_log))
+        // 整库导出为 RDF（0020）。viewer 就能导：能看见的东西本来就能一条条抄走，
+        // 拦在这里只是让诚实的人多花点力气
+        .route("/kbs/{id}/export", get(export_routes::export))
         // 失败任务回队列（#216）：库内给 Editor，全局给管理员
         .route("/kbs/{id}/jobs/failed", get(jobs_routes::failed_in_kb))
         .route("/kbs/{id}/jobs/requeue", post(jobs_routes::requeue_in_kb))
@@ -216,6 +220,15 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
             "/kbs/{id}/ontology/relation-types/{type_id}",
             patch(ontology_routes::update_relation_type)
                 .delete(ontology_routes::delete_relation_type),
+        )
+        // 声明来晚了（#341）：谁的哪一端挂着两个以上开放值；补上声明后把账对一遍
+        .route(
+            "/kbs/{id}/ontology/uniqueness",
+            get(ontology_routes::uniqueness_candidates),
+        )
+        .route(
+            "/kbs/{id}/ontology/relation-types/{type_id}/reconcile",
+            post(ontology_routes::reconcile_relation_type),
         )
         .route(
             "/kbs/{id}/ontology/misses/dismiss",
