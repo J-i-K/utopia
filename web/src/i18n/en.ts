@@ -885,6 +885,12 @@ export const en = {
       modelReset: "Reset",
       modelResetHint:
         "Drop this model's own limit and fall back to the default.",
+      codexAuth: "ChatGPT subscription authentication",
+      codexAuthHint:
+        "Utopia handles subscription sign-in here and stores credentials in its private deployment data. A preauthenticated CODEX_HOME is an optional external fallback only.",
+      codexAuthStatus: (status: string) => `Status: ${status}`,
+      codexAuthCommand: "Start the internal Utopia sign-in above.",
+      codexAuthRequired: "Not authenticated — subscription mode cannot be selected.",
     },
     datasources: {
       tab: "Data sources",
@@ -943,6 +949,17 @@ export const en = {
     modelsIntro:
       "OpenAI-compatible protocol — DeepSeek, Qwen, GLM, Ollama, vLLM all work. Fully on-prem friendly.",
     chatModel: "Chat model",
+    chatAccessMode: "Background access",
+    chatAccessApi: "OpenAI API · Chat Completions",
+    chatAccessSubscription: "ChatGPT subscription · Responses",
+    chatAccessApiHint:
+      "Uses the API key above for background extraction and adjudication. Interactive chat always uses Chat Completions.",
+    chatAccessSubscriptionHint:
+      "Uses this deployment's explicitly configured ChatGPT subscription credentials for background extraction and adjudication. Interactive chat remains on Chat Completions.",
+    chatAccessUnavailable:
+      "Subscription access is not enabled for this deployment. An administrator must configure the Codex credential overlay first.",
+    chatAccessRequiresOpenai:
+      "Subscription mode is available only when the chat base URL uses the exact https://api.openai.com host (the preset is /v1).",
     embedModel: "Embedding model (optional, enables semantic search)",
     baseUrl: "Base URL",
     model: "Model",

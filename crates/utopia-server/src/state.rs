@@ -33,6 +33,8 @@ pub struct AppState {
     pub worker_concurrency: Arc<std::sync::atomic::AtomicUsize>,
     /// 按模型的并发闸门：后台任务调 LLM 前取许可。限额存库，改完即时生效
     pub model_gates: Arc<crate::llm_util::ModelGates>,
+    /// Deployment-scoped background capability and its fixed Codex gate, if enabled.
+    pub background: Arc<crate::llm_util::BackgroundRuntime>,
     pub events: broadcast::Sender<AppEvent>,
     /// 正在生成的回答，按会话查。**刷新页面之后还能接上**（见 `live`）
     pub live: Arc<crate::live::Registry>,
@@ -46,11 +48,12 @@ impl AppState {
         cfg: &AppConfig,
         search: Arc<SearchIndex>,
         jwt_secret: String,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let (events, _) = broadcast::channel(256);
         let data_dir = PathBuf::from(&cfg.data_dir);
         let blob = Arc::new(crate::blob::LocalBlobStore::new(data_dir.join("files")));
-        Self {
+        let background = Arc::new(crate::llm_util::BackgroundRuntime::from_config(cfg)?);
+        Ok(Self {
             pool,
             jwt_secret,
             search,
@@ -60,9 +63,10 @@ impl AppState {
             cookie_secure: cfg.cookie_secure,
             worker_concurrency: Arc::new(std::sync::atomic::AtomicUsize::new(32)),
             model_gates: Arc::new(crate::llm_util::ModelGates::default()),
+            background,
             events,
             live: Arc::new(crate::live::Registry::default()),
-        }
+        })
     }
 
     /// 无订阅者时 send 返回 Err——正常情况，静默忽略。

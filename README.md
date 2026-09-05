@@ -86,6 +86,26 @@ Or build from source:
 docker compose -f docker-compose.yml -f docker-compose.build.yml --profile app up -d --build
 ```
 
+### Optional ChatGPT subscription transport
+
+Background extraction and entity adjudication can opt into the Codex Responses transport through an explicit Compose overlay. The default deployment remains Chat Completions. After the overlay is enabled, workspace admins choose **OpenAI API · Chat Completions** or **ChatGPT subscription · Responses** beside the existing chat model in **System settings → Models**; the selector affects background extraction and adjudication only. Interactive streamed chat and embeddings are not changed by this switch.
+
+Provision a **dedicated Utopia-owned** credential directory outside the repository. It must contain the file-backed `auth.json` produced by the approved Codex device-login procedure, use mode `0700` for the directory and `0600` for the file, and be writable by the application container so rotating refresh tokens can be persisted atomically. Do not mount an operator's normal `~/.codex` profile, copy credentials into `.env`, or commit the directory.
+
+After checking the current Codex revision and the provider's current account/authorization documentation, activate the opt-in path:
+
+```bash
+mkdir -m 700 /srv/utopia-codex-home
+# Complete the approved device-login/provisioning procedure into that directory.
+UTOPIA_CODEX_HOME_HOST=/srv/utopia-codex-home \
+UTOPIA_CODEX_MODEL=gpt-5-codex \
+bash scripts/utopia-codex-compose.sh --profile app up -d
+```
+
+Use the wrapper for this overlay: native Compose only checks that the host-path variable is nonempty; the wrapper rejects relative paths and paths that resolve inside the repository. Startup fails closed when the model, credential directory, credential shape, ownership lock, or concurrency bound is invalid. The initial concurrency is `1`; accepted values are `1..=8`. Responses redirects are never followed, refresh is serialized and atomically persisted, and a permanent authentication failure is terminal rather than retried indefinitely.
+
+To roll back immediately, select **OpenAI API · Chat Completions** in each affected workspace's Models settings, then recreate the app with the base Compose file (or set `UTOPIA_BACKGROUND_LLM_PROVIDER=chat_completions` and remove the overlay). Existing Chat Completions workspace settings remain the rollback path; no source revert is required. Slice 1 does not include interactive streamed Responses, streamed tool-call assembly, or complete Responses tool-call parity.
+
 ### Local development
 
 ```bash

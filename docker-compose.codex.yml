@@ -1,0 +1,21 @@
+# Explicit opt-in overlay for background Codex Responses.
+#
+#   UTOPIA_CODEX_HOME_HOST=/absolute/path/to/dedicated/codex-home \
+#   UTOPIA_CODEX_MODEL=gpt-5-codex \
+#   bash scripts/utopia-codex-compose.sh --profile app up -d
+#
+# Use the wrapper above: Compose itself only checks that the variable is nonempty;
+# the wrapper rejects relative paths and paths inside the repository.
+#
+# The host directory must contain only the Utopia-managed auth.json, be mode 0700,
+# and allow the container service to update auth.json for refresh-token rotation.
+# Do not point this at an operator's normal ~/.codex directory.
+services:
+  app:
+    environment:
+      UTOPIA_BACKGROUND_LLM_PROVIDER: codex_responses
+      UTOPIA_CODEX_MODEL: ${UTOPIA_CODEX_MODEL:?set UTOPIA_CODEX_MODEL before enabling Codex Responses}
+      UTOPIA_CODEX_HOME: /run/utopia-codex
+      UTOPIA_CODEX_MAX_CONCURRENCY: ${UTOPIA_CODEX_MAX_CONCURRENCY:-1}
+    volumes:
+      - ${UTOPIA_CODEX_HOME_HOST:?set UTOPIA_CODEX_HOME_HOST to an absolute dedicated credential directory}:/run/utopia-codex:rw

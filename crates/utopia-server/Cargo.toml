@@ -47,3 +47,5 @@ base64 = "0.23.1"
 
 [dev-dependencies]
 wiremock = "0.6.5"
+utopia-llm = { workspace = true, features = ["test-util"] }
+tempfile.workspace = true

@@ -6,75 +6,7 @@ use crate::llm_util;
 use crate::predicate_match::PredicateIndex;
 use crate::state::AppState;
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 use uuid::Uuid;
-
-/// 限流最多退避重试几次。**只对 429 生效**：密钥错了重试一万次还是错。
-const RATE_LIMIT_TRIES: u32 = 5;
-/// 单次退避的上限。总等待因此封顶在两分钟出头，一个配额永远打满的账号
-/// 会干脆地失败，而不是把 worker 槽占死。
-const RATE_LIMIT_CAP: Duration = Duration::from_secs(60);
-
-/// 退避的抖动。**不引 `rand`**：这里只要「别让 N 个分块同时醒来」，纳秒时钟
-/// 就够散，而多一个依赖要跟着走供应链。
-///
-/// 取半区间（base/2 到 base）而不是全区间：退避仍然单调增长，只是错开。
-fn jitter(base: Duration) -> Duration {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u64::from(d.subsec_nanos()))
-        .unwrap_or(0);
-    let half = (base.as_millis() as u64) / 2;
-    base / 2 + Duration::from_millis(if half == 0 { 0 } else { nanos % half })
-}
-
-/// 抽取的 chat 调用，**限流会退避重试**。
-///
-/// 限流与其他失败的区别是它会自己好，所以从前那句「跳过该分块」用在它身上
-/// 就是把一分钟的等待换成永久的数据缺口——实测一次 1884 块的灌入里
-/// 55/60 篇文档整篇失败，而端点一直是好的。
-///
-/// 两处容易写错：
-///
-/// - **退避期间不能占着许可。** 许可只包住真正的调用，睡觉之前就还回去，
-///   否则一个在等的分块会挡住本来可以通过的另一个。
-/// - **`Retry-After` 多数厂商不发**，所以它只是「有则更准」，判据是错误类型
-///   本身；没有它就走指数退避。
-async fn chat_retrying_rate_limits(
-    state: &AppState,
-    settings: &utopia_core::models::LlmSettings,
-    client: &utopia_llm::LlmClient,
-    messages: &[utopia_llm::ChatMessage],
-) -> anyhow::Result<String> {
-    let mut backoff = Duration::from_secs(2);
-    for attempt in 1..=RATE_LIMIT_TRIES {
-        // 许可只包住调用本身，出了这个块就还回去
-        let outcome = {
-            let _permit = llm_util::acquire_chat(state, settings).await;
-            client.chat(messages).await
-        };
-        let err = match outcome {
-            Ok(reply) => return Ok(reply),
-            Err(e) => e,
-        };
-        let Some(hit) = utopia_llm::rate_limited(&err) else {
-            return Err(err);
-        };
-        if attempt == RATE_LIMIT_TRIES {
-            return Err(err.context(format!("限流退避 {RATE_LIMIT_TRIES} 次仍未通过")));
-        }
-        let delay = jitter(hit.retry_after.unwrap_or(backoff).min(RATE_LIMIT_CAP));
-        tracing::warn!(
-            attempt,
-            delay_ms = delay.as_millis() as u64,
-            from_header = hit.retry_after.is_some(),
-            "端点限流，退避后重试"
-        );
-        tokio::time::sleep(delay).await;
-        backoff = (backoff * 2).min(RATE_LIMIT_CAP);
-    }
-    unreachable!("循环内必定 return")
-}
 
 const MIN_CONFIDENCE: f32 = 0.6;
 
@@ -135,8 +67,12 @@ fn is_entity_name(name: &str) -> bool {
     true
 }
 
+fn is_terminal_background_failure(error: &anyhow::Error) -> bool {
+    utopia_llm::out_of_credit(error).is_some() || utopia_llm::is_permanent_authentication(error)
+}
+
 /// 记一条丢弃信号。抽取器有七处 `continue`，每一处都是"事实抽出来了、被挡掉、
-/// 什么都不说"。信号写失败绝不能带垮整篇文档的抽取，所以这里吞掉错误。
+/// 什么都不说。信号写失败绝不能带垮整篇文档的抽取，所以这里吞掉错误。
 async fn drop_signal(
     state: &AppState,
     kb_id: Uuid,
@@ -289,11 +225,11 @@ async fn resolve(
 async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> anyhow::Result<()> {
     let doc = utopia_store::documents::get(&state.pool, document_id).await?;
     let kb = utopia_store::kbs::get(&state.pool, doc.kb_id).await?;
-    let settings = utopia_store::settings::get(&state.pool, kb.workspace_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Chat model not configured; cannot extract"))?;
-    let client = llm_util::chat_client(&settings)
-        .ok_or_else(|| anyhow::anyhow!("Chat model not configured; cannot extract"))?;
+    let settings = utopia_store::settings::get(&state.pool, kb.workspace_id).await?;
+    let client = state
+        .background
+        .client(settings.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("background model not configured; cannot extract"))?;
 
     // 所有权凭证：重抽会自增 epoch，本任务据此察觉自己已被接管（见分块循环）
     let my_epoch = utopia_store::documents::extract_epoch(&state.pool, document_id).await?;
@@ -459,9 +395,20 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
         );
         // 这两处 continue 跳过的是**整个分块**——它一条事实都没产出。
         // 记下来，收尾时据此决定这篇文档算不算抽完（见循环之后）
-        let reply = match chat_retrying_rate_limits(state, &settings, &client, &messages).await {
+        let reply = match llm_util::complete_with_rate_limit_retry(
+            state,
+            settings.as_ref(),
+            state.background.as_ref(),
+            &client,
+            &messages,
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
+                if is_terminal_background_failure(&e) {
+                    return Err(e.context("background provider authentication or credit failure"));
+                }
                 tracing::warn!(%document_id, seq = chunk.seq, error = %e, "抽取调用失败，跳过该分块");
                 unextracted.push((chunk.seq, format!("调用失败：{e}")));
                 continue;
@@ -1585,7 +1532,8 @@ mod name_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{incomplete_reason, looks_literal};
+    use super::{incomplete_reason, is_terminal_background_failure, looks_literal};
+    use anyhow::Context;
 
     #[test]
     fn only_numbers_and_dates_count_as_literals() {
@@ -1606,6 +1554,19 @@ mod tests {
         ] {
             assert!(!looks_literal(no), "{no} 不该认成字面值");
         }
+    }
+
+    #[test]
+    fn permanent_background_auth_survives_added_context() {
+        let error = Err::<(), _>(utopia_llm::BackgroundTextError::Authentication {
+            kind: utopia_llm::BackgroundAuthFailure::Permanent,
+            detail: "fixture",
+        })
+        .context("extraction wrapper")
+        .unwrap_err();
+        assert!(is_terminal_background_failure(&error));
+        assert!(crate::alerting::hopeless(&error));
+        assert!(error.to_string().contains("extraction wrapper"));
     }
 
     /// 这条判据存在的理由：一次网络抖动让六篇文档 60 块里只抽成 12 块，

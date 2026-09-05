@@ -30,12 +30,20 @@ pub async fn get_deployment(
     let onto_lang = utopia_store::access::default_ontology_lang(&state.pool).await?;
     let (limits, dflt) = utopia_store::model_limits::list(&state.pool).await?;
     let in_use = utopia_store::model_limits::models_in_use(&state.pool).await?;
+    let auth_status = match state.background.subscription_auth_status() {
+        Some(utopia_llm::CodexAuthStatus::Authenticated) => "authenticated",
+        Some(utopia_llm::CodexAuthStatus::Unauthenticated) => "unauthenticated",
+        Some(utopia_llm::CodexAuthStatus::Invalid) => "invalid",
+        None => "unavailable",
+    };
     Ok(Json(json!({
         "open_registration": open,
         "worker_concurrency": workers,
         "default_ontology_lang": onto_lang,
         "model_limits": limits,
         "default_model_concurrency": dflt,
+        "subscription_auth_status": auth_status,
+        "subscription_auth_flow": state.background.subscription_auth_flow_status().unwrap_or_else(|| json!({"status": "idle"})),
         "models_in_use": in_use.into_iter().map(|(b, m, k)| json!({"base_url": b, "model": m, "kind": k})).collect::<Vec<_>>(),
     })))
 }
@@ -91,6 +99,47 @@ pub async fn put_deployment(
             .await?;
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+pub async fn start_codex_auth(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(&user)?;
+    let result = state
+        .background
+        .start_subscription_auth()
+        .await
+        .map_err(|_| {
+            AppError::invalid(
+                "codex_auth_start_failed",
+                "Unable to start Codex authentication",
+            )
+        })?;
+    Ok(Json(result))
+}
+
+pub async fn codex_auth_status(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(&user)?;
+    Ok(Json(
+        state
+            .background
+            .subscription_auth_flow_status()
+            .unwrap_or_else(|| json!({ "status": "idle" })),
+    ))
+}
+
+pub async fn cancel_codex_auth(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin(&user)?;
+    Ok(Json(
+        json!({ "ok": state.background.cancel_subscription_auth() }),
+    ))
 }
 
 #[derive(Deserialize)]

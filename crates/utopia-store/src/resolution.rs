@@ -1577,7 +1577,8 @@ pub async fn get_verdict(
     pair_key: &str,
 ) -> AppResult<Option<(Option<bool>, f32)>> {
     let row: Option<(Option<bool>, f32)> = sqlx::query_as(
-        "SELECT same, confidence FROM resolution_verdicts WHERE kb_id = $1 AND pair_key = $2",
+        "SELECT same, confidence FROM resolution_verdicts
+         WHERE kb_id = $1 AND pair_key = $2",
     )
     .bind(kb_id)
     .bind(pair_key)

@@ -75,7 +75,7 @@ async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
     utopia_store::documents::set_ready(&state.pool, document_id, text_len, chunk_count).await?;
 
     // 两段式：索引就绪后，若配置了对话模型则排队图谱抽取（不阻塞可搜可问）
-    if settings.as_ref().is_some_and(|s| s.chat_ready()) {
+    if state.background.ready(settings.as_ref()) {
         utopia_store::documents::set_graph_status(&state.pool, document_id, "queued").await?;
         utopia_store::jobs::enqueue(
             &state.pool,
@@ -133,7 +133,7 @@ pub async fn memory_ingest(
     let did = document_id.to_string();
     tokio::task::spawn_blocking(move || search.reindex_document(&kb, &did, &pairs)).await??;
 
-    if settings.as_ref().is_some_and(|s| s.chat_ready()) {
+    if state.background.ready(settings.as_ref()) {
         utopia_store::documents::set_graph_status(&state.pool, document_id, "queued").await?;
         utopia_store::jobs::enqueue(
             &state.pool,

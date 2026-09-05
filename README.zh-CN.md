@@ -87,6 +87,26 @@ docker compose --profile app up -d
 docker compose -f docker-compose.yml -f docker-compose.build.yml --profile app up -d --build
 ```
 
+### 可选的 ChatGPT 订阅传输
+
+后台抽取与实体裁决可以通过显式 Compose overlay 选择 Codex Responses；默认部署仍使用 Chat Completions。启用 overlay 后，工作区管理员可在「系统设置 → 模型」现有对话模型旁选择「OpenAI API · Chat Completions」或「ChatGPT 订阅 · Responses」；这个选择只影响后台抽取与实体裁决。交互式流式聊天和 embedding 不会因这个开关改变。
+
+请在仓库之外准备一个**由 Utopia 专用**的凭据目录。目录内只能放经批准的 Codex 设备登录流程生成的文件型 `auth.json`；目录权限为 `0700`，文件权限为 `0600`，并允许应用容器写入，以便原子保存轮换后的 refresh token。不要挂载操作员平时使用的 `~/.codex`，不要把凭据写入 `.env`，也不要提交这个目录。
+
+重新核对当前 Codex revision 以及提供方最新的账户/授权文档后，显式启用：
+
+```bash
+mkdir -m 700 /srv/utopia-codex-home
+# 按批准的设备登录/凭据配置流程将 auth.json 写入该目录。
+UTOPIA_CODEX_HOME_HOST=/srv/utopia-codex-home \
+UTOPIA_CODEX_MODEL=gpt-5-codex \
+bash scripts/utopia-codex-compose.sh --profile app up -d
+```
+
+请使用上述 wrapper：原生 Compose 只检查宿主机路径变量非空；wrapper 会拒绝相对路径以及解析到仓库内部的路径。当模型、凭据目录、凭据结构、所有权锁或并发范围无效时，服务会 fail closed。初始并发为 `1`，允许 `1..=8`；Responses 与 refresh 的重定向永不跟随，refresh 串行化并原子持久化，永久认证失败会终止任务而不是无限重试。
+
+要立即回滚，先在受影响 workspace 的「模型」设置中选择「OpenAI API · Chat Completions」，再用基础 Compose 文件重新创建 app（或设置 `UTOPIA_BACKGROUND_LLM_PROVIDER=chat_completions` 并移除 overlay）。现有 Chat Completions workspace 设置就是回滚路径，不需要回退源码。Slice 1 不包含交互式流式 Responses、流式 tool-call 组装或完整 Responses tool-call 对等能力。
+
 ### 本地开发
 
 ```bash

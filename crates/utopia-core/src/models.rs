@@ -332,6 +332,47 @@ pub struct ChunkView {
     pub filename: String,
 }
 
+/// How a workspace's OpenAI chat model authenticates and reaches the background text API.
+///
+/// `api` uses the workspace's OpenAI-compatible Chat Completions settings. `subscription`
+/// uses the deployment's explicitly provisioned ChatGPT/Codex Responses credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatAccessMode {
+    #[default]
+    Api,
+    Subscription,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("unknown chat access mode: {0}")]
+pub struct InvalidChatAccessMode(String);
+
+impl TryFrom<String> for ChatAccessMode {
+    type Error = InvalidChatAccessMode;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(&value).ok_or(InvalidChatAccessMode(value))
+    }
+}
+
+impl ChatAccessMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Subscription => "subscription",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "api" => Some(Self::Api),
+            "subscription" => Some(Self::Subscription),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct LlmSettings {
     pub workspace_id: Uuid,
@@ -339,6 +380,8 @@ pub struct LlmSettings {
     #[serde(skip_serializing)]
     pub chat_api_key: Option<String>,
     pub chat_model: Option<String>,
+    #[sqlx(try_from = "String")]
+    pub chat_access_mode: ChatAccessMode,
     pub embed_base_url: Option<String>,
     #[serde(skip_serializing)]
     pub embed_api_key: Option<String>,

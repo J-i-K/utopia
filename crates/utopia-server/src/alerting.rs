@@ -64,7 +64,7 @@ pub async fn observe_job_failure(
 /// 判据与 [`alert_for`] 同源（`utopia_llm::out_of_credit`，类型不是文本），
 /// 于是「报成 error 那一类」与「不再重试那一类」永远是同一类，不会分叉。
 pub fn hopeless(err: &anyhow::Error) -> bool {
-    utopia_llm::out_of_credit(err).is_some()
+    utopia_llm::out_of_credit(err).is_some() || utopia_llm::is_permanent_authentication(err)
 }
 
 /// 一次任务失败该报哪一类告警，报不报。
@@ -82,6 +82,9 @@ fn alert_for(err: &anyhow::Error) -> Option<(&'static str, &'static str)> {
     if utopia_llm::out_of_credit(err).is_some() {
         // `error`：它不会自己好，在有人充值之前抽取一直是停的
         return Some((alerts::kind::LLM_OUT_OF_CREDIT, "error"));
+    }
+    if utopia_llm::is_permanent_authentication(err) {
+        return Some((alerts::kind::LLM_AUTHENTICATION_FAILED, "error"));
     }
     if utopia_llm::rate_limited(err).is_some() {
         // `warning` 不是 `error`：配额会自己恢复，端点挂了不会
@@ -156,7 +159,7 @@ pub async fn observe_schema_sync_failure(
 #[cfg(test)]
 mod tests {
     use super::alert_for;
-    use utopia_llm::{OutOfCredit, RateLimited};
+    use utopia_llm::{BackgroundAuthFailure, BackgroundTextError, OutOfCredit, RateLimited};
     use utopia_store::alerts::kind;
 
     /// 限流与端点不可达是两类事，报的告警必须分开。
@@ -225,6 +228,19 @@ mod tests {
     fn an_auth_failure_raises_nothing() {
         let err = anyhow::anyhow!("LLM request failed (401 Unauthorized): bad key");
         assert_eq!(alert_for(&err), None);
+    }
+
+    #[test]
+    fn permanent_background_auth_is_terminal_and_has_its_own_alert() {
+        let err = anyhow::Error::new(BackgroundTextError::Authentication {
+            kind: BackgroundAuthFailure::Permanent,
+            detail: "provider rejected credentials",
+        });
+        assert_eq!(
+            alert_for(&err),
+            Some((kind::LLM_AUTHENTICATION_FAILED, "error"))
+        );
+        assert!(super::hopeless(&err));
     }
 
     /// **余额不会在七分钟里自己长回来**，所以那三次退避重试只是把同一句错误

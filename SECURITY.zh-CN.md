@@ -23,6 +23,20 @@ Utopia 目前是 v0.1。下面是**已知的、尚未解决的**限制 —— �
 - **账号是停用不是删除** —— `users.deactivated_at` 挡住登录，而这个人做过的决定仍可归属地留在台账里。
 - **口令哈希用 argon2。**
 
+## 可选的 ChatGPT 订阅传输
+
+后台文档抽取和实体裁决可以配置为 Codex Responses，但它**默认关闭**。交互式聊天、聊天工具、本体/类型消解以及 embedding 仍走原来的 Chat Completions 或 embedding 路径。
+
+Codex 能力是部署级的，而传输方式选择放在现有的工作区级「模型」选择器里。启用显式 `docker-compose.codex.yml` overlay 后，工作区管理员可以为该工作区的后台抽取与实体裁决选择 OpenAI API / Chat Completions 或 ChatGPT 订阅 / Responses。订阅凭据属于部署，不会进入或返回工作区设置。只有精确的 `https://api.openai.com` 地址可以保存订阅模式；其他 OpenAI 兼容接口仍使用 Chat Completions。只能通过 `bash scripts/utopia-codex-compose.sh` 启用；wrapper 会在调用 Compose 前拒绝相对宿主机路径以及解析到仓库内部的路径，原生 Compose 只提供非空变量检查。请在仓库之外使用一个 Utopia 专用的 `CODEX_HOME`。不要挂载操作员平时用的 `~/.codex`，不要把 token 写进 `.env`、Postgres、日志、备份或源码。
+
+凭据目录必须是 `0700`，里面是文件型 `auth.json`，权限为 `0600`。应用必须能读写它，因为 refresh token 轮换要原子持久化。Utopia 会持有进程全程的所有权锁；不要让其他 Codex 进程并发使用这个目录。普通备份应排除这个目录；如果访问权被撤销，或刷新持久化的耐久性变得不确定，应按批准的设备登录流程重新配置，而不是把旧快照当作可靠恢复件。
+
+当前容器镜像没有声明非 root 运行用户。因此，一旦应用进程被攻破，它可以读取挂载进来的 access/refresh 凭据。专用目录限制的是误用和配置碰撞，不是对被攻破的 Utopia 进程或宿主机管理员的隔离。
+
+生产 Responses 与 refresh 主机是编译期固定的 HTTPS 地址，并且不跟随重定向。替代主机只能通过 Rust 的测试专用 feature 注入。启动只检查本地的模型、凭据形状、路径、权限、所有权锁和并发上限，不会远程调用模型。刷新是 single-flight、有时限的；永久认证失败或持久化耐久性不确定时会关闭发送。失败或不完整的 Responses 流不算模型输出，限流仍由原有的有界重试方负责。
+
+设备登录成功不等于账号获准把订阅用于这种服务端调用，也不等于提供方允许 Utopia 复用该 OAuth 客户端流程。这些是独立的操作员与提供方闸门。仓库测试没有、也不能声称完成真实订阅请求或部署验收。
+
 ## 报告漏洞
 
 请发邮件到 **security@deeplethe.com**，不要开公开 issue。写明受影响的版本或提交、端点或组件、复现步骤。几天内会有回复；带修复的那个版本会在说明里致谢，除非你不希望。

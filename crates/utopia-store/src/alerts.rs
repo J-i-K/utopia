@@ -45,6 +45,8 @@ pub mod kind {
     /// 配额到点重置，欠费不会。在有人去充值之前，这个部署的抽取与向量化
     /// 一直是停的。
     pub const LLM_OUT_OF_CREDIT: &str = "llm.out_of_credit";
+    /// 系统级：后台模型认证永久失败。与网络不可达分开，避免让运维去查错误的边界。
+    pub const LLM_AUTHENTICATION_FAILED: &str = "llm.authentication_failed";
     /// 库级：数据源挂上了，它的库表结构却没摄进来。`min_role = admin`
     ///
     /// **这一条描述的不是那次失败，是它留下的状态**：源挂着，而问数看不见它有
