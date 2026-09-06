@@ -48,6 +48,7 @@ The test for writing one: if someone (including us) looks at a piece of code in 
 | 0022 | [An unknown date is not an open one](0022-an-unknown-date-is-not-an-open-one.md) | Implemented in two cuts (#394 and the derived cut) · `world_axis` predicate beside `record_axis`, `facts.attested_at` anchors a missing start or an undated end at the document that attests it, every read and both client filters on the read interval, an undated ending closes the dated row it ends, derived rows intersect premise intervals as read and carry no precision on an anchored bound · a bare open row plus an undated ending is #393 |
 | 0023 | [RSS observations are not documents](0023-rss-observations-are-not-documents.md) | Implemented in #326 |
 | 0024 | [The world axis reaches the second](0024-the-world-axis-reaches-the-second.md) | Implemented · the precision ladder runs year → second (not below: no source states less), a stored value is truncated to its precision by CHECK on all three tables, a clock time without a zone is a date, one list spells the ladder in the extractor, the renderers, the export and the evaluator; a derived bound takes the precision of the premise that set it |
+| 0025 | [Background ChatGPT subscription authentication](0025-background-chatgpt-subscription-authentication.md) | Proposed · awaiting discussion in #435; no implementation submitted |
 
 ## Not a decision record
 
